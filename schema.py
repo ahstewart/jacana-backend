@@ -2,11 +2,11 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import List, Dict, Any, Optional
-
 from pydantic import BaseModel as PydanticBaseModel
 from sqlmodel import SQLModel, Field, Relationship
 from sqlalchemy import Column
 from sqlalchemy.dialects.postgresql import JSONB
+from pipeline_schema import PipelineConfig
 
 # ==========================================
 # 0. HELPERS
@@ -19,96 +19,45 @@ def utc_now():
 # ==========================================
 
 class ModelCategory(str, Enum):
-    UTILITY = "utility"             # e.g. Watermelon Thumper
-    DIAGNOSTIC = "diagnostic"       # e.g. Engine Sound Analyzer
-    PERFORMANCE = "performance"     # e.g. NPU Benchmarks
-    FUN = "fun"                     # e.g. Dog Breed Identifier
+    UTILITY = "utility"             
+    DIAGNOSTIC = "diagnostic"       
+    PERFORMANCE = "performance"     
+    FUN = "fun"                     
     OTHER = "other"
-
-class AssetType(str, Enum):
-    TFLITE = "tflite"
-    LABEL_TXT = "label_txt"
-    VOCAB_TXT = "vocab_txt"
-    CONFIG_JSON = "config_json"
 
 class DevicePlatform(str, Enum):
     ANDROID = "android"
     IOS = "ios"
 
-class LicenseType(str, Enum):
-    # --- The "Green Light" (Safe for Commercial) ---
-    APACHE_2_0 = "apache-2.0"
-    MIT = "mit"
-    BSD = "bsd"             # Generic BSD family
-    BSD_3_CLAUSE = "bsd-3-clause"
-    BSD_3_CLAUSE_CLEAR = "bsd-3-clause-clear"
-    CC0_1_0 = "cc0-1.0"     # Public Domain
-    AFL_3_0 = "afl-3.0"     # Academic Free License
-
-    # --- The "Yellow Light" (Attribution / Restrictions) ---
-    CC_BY_4_0 = "cc-by-4.0"
-    CC_BY_SA_3_0 = "cc-by-sa-3.0"
-    CC_BY_SA_4_0 = "cc-by-sa-4.0"
-    OPENRAIL = "openrail"
-    OPENRAIL_M = "openrail++" # Often used for Stable Diffusion variants
-    
-    # --- The "Red Light" (Non-Commercial / Copyleft) ---
-    CC_BY_NC_4_0 = "cc-by-nc-4.0"
-    CC_BY_NC_SA_4_0 = "cc-by-nc-sa-4.0"
-    CC_BY_NC_ND_4_0 = "cc-by-nc-nd-4.0"
-    GPL_3_0 = "gpl-3.0"
-    AGPL_3_0 = "agpl-3.0"
-    LLAMA_2 = "llama2"      # Meta's custom license
-    LLAMA_3 = "llama3"      # Meta's custom license
-    
-    # --- Fallback ---
-    OTHER = "other"
-    UNKNOWN = "unknown"
-
-    @property
-    def is_commercial_allowed(self) -> bool:
-        """
-        Helper to determine if this license generally allows commercial use.
-        NOTE: This is a heuristic, not legal advice.
-        """
-        SAFE_LICENSES = {
-            LicenseType.APACHE_2_0, 
-            LicenseType.MIT, 
-            LicenseType.BSD,
-            LicenseType.BSD_3_CLAUSE,
-            LicenseType.BSD_3_CLAUSE_CLEAR,
-            LicenseType.CC0_1_0,
-            LicenseType.AFL_3_0,
-            LicenseType.CC_BY_4_0, # Allowed, but requires attribution
-            LicenseType.OPENRAIL, # Usually allowed with restrictions
-            LicenseType.OPENRAIL_M,
-        }
-        return self in SAFE_LICENSES
-    
-
 # ==========================================
 # 2. JSON COMPONENTS (The "Inner" Data)
 # ==========================================
-# These are used for Validation in API Requests/Responses
+# Strict validation for our Dart/Flutter engine execution
 
 class PipelineStep(PydanticBaseModel):
-    step_name: str
+    # Matches the React UI state exactly (e.g., "resize_image", "normalize")
+    step: str 
     params: Dict[str, Any] = {}
 
 class PipelineConfig(PydanticBaseModel):
-    input_nodes: List[str]
-    output_nodes: List[str]
-    pre_processing: List[PipelineStep] = []
-    post_processing: List[PipelineStep] = []
-    asset_map: Dict[str, str] = {}
+    # Matches the React UI state (no underscores)
+    preprocessing: List[PipelineStep] = []
+    postprocessing: List[PipelineStep] = []
+    # Can be added later when we extract flatbuffer data:
+    input_nodes: Optional[List[str]] = None
+    output_nodes: Optional[List[str]] = None
 
-class MLModelAsset(PydanticBaseModel):
-    asset_key: str
-    asset_type: AssetType
-    source_url: str 
-    file_size_bytes: int
-    file_hash: str 
-    is_hosted_by_us: bool = False
+# 1. Define the Strict Asset Contract
+class AssetPointers(PydanticBaseModel):
+    """
+    Highly extensible pointer map. 
+    Adding new asset types here requires ZERO Postgres migrations.
+    """
+    tflite: str  # The core execution binary is always required
+    labels: Optional[str] = None
+    tokenizer: Optional[str] = None
+    vocab: Optional[str] = None
+    anchors: Optional[str] = None # For complex object detection
 
 # ==========================================
 # 3. USER ENTITY
@@ -118,7 +67,6 @@ class UserBase(SQLModel):
     username: str = Field(index=True, unique=True)
     email: str = Field(index=True, unique=True)
     is_developer: bool = False
-    # FIX: Use helper function for time
     created_at: datetime = Field(default_factory=utc_now)
     hf_username: Optional[str] = Field(default=None, index=True)
     hf_verification_token: Optional[str] = Field(default=None)
@@ -131,8 +79,13 @@ class UserDB(UserBase, table=True):
     # Relationships
     models: List["MLModelDB"] = Relationship(back_populates="author")
 
-class UserRead(UserBase):
+class UserRead(PydanticBaseModel):
     id: uuid.UUID
+    username: str
+    email: str
+    is_developer: bool
+    created_at: datetime
+    hf_username: Optional[str] = None
 
 # ==========================================
 # 4. ML MODEL ENTITY (The "Product")
@@ -143,8 +96,6 @@ class MLModelBase(SQLModel):
     slug: Optional[str] = Field(index=True, unique=True)
     description: Optional[str] = None
     category: ModelCategory = Field(default=ModelCategory.UTILITY)
-    license_type: str = Field(nullable=False, default=LicenseType.UNKNOWN) # Default to UNKNOWN for safety
-    origin_repo_url: Optional[str] = None
 
 class MLModelDB(MLModelBase, table=True):
     __tablename__ = "ml_models"
@@ -153,10 +104,8 @@ class MLModelDB(MLModelBase, table=True):
     hf_model_id: Optional[str] = Field(default=None, index=True)
     is_verified_official: bool = False
     
-    # FIX: Use default_factory for mutable list
     tags: List[str] = Field(sa_column=Column(JSONB), default_factory=list)
-    # Stores "image-classification", "text-generation", etc.
-    # We use a string so we don't crash if HF introduces a new task.
+    # Dynamic Task String (e.g., "image-classification") - Not an Enum!
     task: Optional[str] = Field(default=None, index=True)
     
     # Metrics
@@ -173,15 +122,17 @@ class MLModelCreate(MLModelBase):
     description: str
     tags: List[str] = Field(default_factory=list)
 
-class MLModelRead(MLModelBase):
+class MLModelRead(PydanticBaseModel):
     id: uuid.UUID
     author_id: uuid.UUID
+    name: str
+    slug: Optional[str] = None
     description: str
+    category: ModelCategory = ModelCategory.UTILITY
     tags: List[str]
     total_download_count: int
     total_ratings: int
-    # FIX: Renamed to match DB column exactly
-    rating_weighted_avg: float 
+    rating_weighted_avg: float
     created_at: datetime
 
 # ==========================================
@@ -189,22 +140,32 @@ class MLModelRead(MLModelBase):
 # ==========================================
 
 class ModelVersionBase(SQLModel):
-    version_string: str = Field(index=True) # "1.0.0"
+    version_name: str = Field(index=True) # Usually the short commit_sha
+    commit_sha: str = Field(index=True)   # The strict pointer lock
+    
+    # Strict Pointer Strategy enforcement
+    is_hosted_by_us: bool = False
+    assets: AssetPointers = Field(sa_column=Column(JSONB, nullable=False))
+    
+    # Commercial Safety Check
+    license_type: str = Field(default="unknown")
+    is_commercial_safe: bool = False
+    requires_commercial_warning: bool = False
+    file_size_bytes: int = 0
+    
+    # State tracking ("unconfigured" vs "configured")
+    status: str = Field(default="unconfigured", index=True)
     changelog: Optional[str] = None
 
 class ModelVersionDB(ModelVersionBase, table=True):
     __tablename__ = "model_versions"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     model_id: uuid.UUID = Field(foreign_key="ml_models.id")
-    # Stores the specific git commit hash (e.g. "9a3f2b...")
-    # This ensures we know exactly which version of the file we are pointing to
-    hf_commit_sha: Optional[str] = None
     
-    # Typed as generic Dict/List for SQL storage safety
-    # We trust the 'Create' model to validate the structure before saving
-    pipeline_spec: Dict[str, Any] = Field(sa_column=Column(JSONB))
-    assets: List[Dict[str, Any]] = Field(sa_column=Column(JSONB))
-    
+    pipeline_spec: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB))
+    is_supported: bool = Field(default=False)
+    unsupported_reason: Optional[str] = None
+
     published_at: datetime = Field(default_factory=utc_now)
     download_count: int = 0
     num_ratings: int = 0
@@ -215,20 +176,32 @@ class ModelVersionDB(ModelVersionBase, table=True):
     logs: List["InferenceLogDB"] = Relationship(back_populates="version")
 
 class ModelVersionCreate(ModelVersionBase):
-    # Strict validation happens here on input
-    pipeline_spec: PipelineConfig
-    assets: List[MLModelAsset]
+    # Validated strictly through Pydantic upon creation/update
+    pipeline_spec: Optional[PipelineConfig] = None
 
-class ModelVersionRead(ModelVersionBase):
+class ModelVersionRead(PydanticBaseModel):
     id: uuid.UUID
     model_id: uuid.UUID
-    # Strict validation happens here on output
-    pipeline_spec: PipelineConfig
-    assets: List[MLModelAsset]
+    version_name: str
+    commit_sha: str
+    is_hosted_by_us: bool = False
+    assets: AssetPointers
+    license_type: str = "unknown"
+    is_commercial_safe: bool = False
+    requires_commercial_warning: bool = False
+    file_size_bytes: int = 0
+    status: str = "unconfigured"
+    changelog: Optional[str] = None
+    pipeline_spec: Optional[PipelineConfig] = None
     published_at: datetime
     download_count: int
     num_ratings: int
     rating_avg: float
+
+class ModelVersionUpdate(PydanticBaseModel):
+    # This invokes our strict PipelineConfig rules
+    pipeline_spec: Optional[PipelineConfig] = None
+    status: str
 
 # ==========================================
 # 6. TELEMETRY
@@ -236,7 +209,7 @@ class ModelVersionRead(ModelVersionBase):
 
 class InferenceLogDB(SQLModel, table=True):
     __tablename__ = "inference_logs"
-    id: Optional[int] = Field(default=None, primary_key=True) # BigInt auto-increment
+    id: Optional[int] = Field(default=None, primary_key=True) 
     model_version_id: uuid.UUID = Field(foreign_key="model_versions.id")
     timestamp: datetime = Field(default_factory=utc_now, index=True)
     
@@ -252,14 +225,3 @@ class InferenceLogCreate(SQLModel):
     platform: DevicePlatform
     total_inference_ms: int
     success: bool
-
-# ==========================================
-# 7. SPECIAL API RESPONSES
-# ==========================================
-
-class ModelManifestResponse(PydanticBaseModel):
-    id: uuid.UUID
-    name: str
-    version: str
-    assets: List[MLModelAsset]
-    pipeline: PipelineConfig

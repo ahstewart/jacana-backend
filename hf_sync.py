@@ -14,11 +14,12 @@ from datetime import datetime, timezone
 from sqlmodel import Session, select
 from huggingface_hub import HfApi
 import sqlalchemy
-import urllib.error
+import time
 
-from schema import MLModelDB, UserDB, ModelCategory, LicenseType
+from schema import MLModelDB, ModelVersionDB, UserDB, ModelCategory
 from database import engine
 from config import get_settings
+from scanner import scan_hf_repo_for_version_assets
 
 # get .env configs
 settings = get_settings()
@@ -28,185 +29,247 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def get_or_create_system_user(session: Session) -> UserDB:
+def get_or_create_system_user(session: Session) -> uuid.UUID:
     """
-    Get or create a system user for synced models.
-    All auto-synced models will be attributed to this user.
+    Ensures we have a 'Pocket AI System' user to act as the author 
+    for automatically synced open-source models.
     """
-    statement = select(UserDB).where(UserDB.username == "hf_sync_system")
-    system_user = session.exec(statement).first()
+    system_email = "system@pocketailab.com"
+    user = session.exec(select(UserDB).where(UserDB.email == system_email)).first()
     
-    if not system_user:
-        system_user = UserDB(
-            id=uuid.uuid4(),
-            username="hf_sync_system",
-            email="system@pocket-ai.local",
+    if not user:
+        user = UserDB(
+            username="PocketAISystem",
+            email=system_email,
             is_developer=True,
-            hf_username=None
+            hf_username="pocket_ai_system"
         )
-        session.add(system_user)
+        session.add(user)
         session.commit()
-        session.refresh(system_user)
-        logger.info(f"Created system user: {system_user.id}")
-    
-    return system_user
-
-
-def fetch_literrt_models(limit: int = settings.HF_SYNC_FETCH_LIMIT) -> List[Dict[str, Any]]:
-    """
-    Fetch all public HuggingFace models with 'LiteRT' library.
-    
-    Returns a list of model info dictionaries.
-    """
-    api = HfApi()
-    models = []
-    
-    try:
-        logger.info("Starting fetch of LiteRT models from HuggingFace...")
+        session.refresh(user)
         
-        # Query for models with LiteRT library using the filter parameter
-        # This is more efficient than search
-        result = api.list_models(
+    return user.id
+
+def extract_tag_value(tags: list, prefix: str) -> str:
+    """Helper to safely extract tags like 'license:mit' -> 'mit'."""
+    if not tags:
+        return ""
+    for tag in tags:
+        if tag.startswith(prefix):
+            return tag.replace(prefix, "")
+    return ""
+
+def sync_huggingface_models(limit: int = 50):
+    """
+    The main sync loop. Run this as a background job (cron, Celery, etc.).
+    """
+    print(f"Starting Hugging Face Sync Job (Targeting top {limit} TFLite models)...")
+    api = HfApi()
+    
+    # Query HF for models with a library of 'tflite'
+    hf_models = api.list_models(
             filter="tflite",
             limit=limit,
             full=True,  # Get full metadata
         )
-        
-        public_count = 0
-        private_count = 0
-
-        for model_info in result:
-            # Filter to only public models
-            if model_info.private:
-                private_count += 1
-                continue
-            
-            # Filter to only applicable mobile-optimized models, using library or tag names
-            #if (model_info.library_name in settings.HF_APPLICABLE_LIBRARIES) or (any(lib in model_info.tags for lib in settings.HF_APPLICABLE_LIBRARIES)):
-            # Extract description safely
-            description = ""
-            if model_info.cardData and isinstance(model_info.cardData, dict):
-                description = model_info.cardData.get("summary", "") or model_info.cardData.get("description", "")
-            
-            models.append({
-                "id": model_info.id,
-                "name": model_info.id.split("/")[-1],  # Use repo name
-                "description": description,
-                "tags": model_info.tags or [],
-                "task": model_info.pipeline_tag,
-                "license": model_info.cardData.get("license", "unknown") if model_info.cardData else "unknown",
-                "sha": model_info.sha,
-            })
-
-            public_count += 1
-            
-           # else:
-           #     logger.debug(f"Skipping model {model_info.id} - library '{model_info.library_name}' not in applicable list.")
-        
-        logger.info(f"Found {public_count} public LiteRT models after filtering, and {private_count} private models. Ready for syncing.")
-        return models
-        
-    except urllib.error.HTTPError as e:
-        logger.error(f"HuggingFace API error: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching models: {e}")
-        raise
-
-
-def map_hf_license_to_enum(license_str: str) -> str:
-    """Map HuggingFace license string to our LicenseType enum."""
-    if not license_str:
-        return LicenseType.UNKNOWN
     
-    # Normalize the string
-    license_str = license_str.lower().strip()
-    
-    # Try direct mapping
-    for license_type in LicenseType:
-        if license_type.value == license_str:
-            return license_type
-    
-    # Fallback to UNKNOWN if no match
-    return LicenseType.UNKNOWN
+    stats = {"models created": 0, "models updated": 0, "models skipped": 0,
+                 "model versions created": 0, "model versions updated": 0, "model versions skipped": 0,}
 
-
-def sync_literrt_models(models: List[Dict[str, Any]]) -> Dict[str, int]:
-    """
-    Sync fetched LiteRT models to the database.
-    
-    Returns a dict with counts:
-    - created: number of new models created
-    - updated: number of existing models updated
-    - skipped: number of models skipped due to errors
-    """
     with Session(engine) as session:
-        system_user = get_or_create_system_user(session)
-        stats = {"created": 0, "updated": 0, "skipped": 0}
+        system_author_id = get_or_create_system_user(session)
         
-        for model_data in models:
+        for hf_model in hf_models:
+            repo_id = hf_model.id
+            commit_sha = getattr(hf_model, "sha", None)
+            
+            if not commit_sha:
+                print(f"[{repo_id}] Skipping: No commit SHA available.")
+                stats["models skipped"] += 1
+                continue
+                
+            print(f"[{repo_id}] Processing...")
+            
             try:
-                hf_model_id = model_data["id"]
+                # 1. Parse Metadata
+                # 'pipeline_tag' is HF's official task categorization (e.g., 'image-classification')
+                task = getattr(hf_model, "pipeline_tag", "unknown") 
+                license_type = extract_tag_value(getattr(hf_model, "tags", []), "license:")
                 
-                # Check if model already exists
-                statement = select(MLModelDB).where(
-                    MLModelDB.hf_model_id == hf_model_id
-                )
-                existing_model = session.exec(statement).first()
+                # 2. Create or Update the Parent Model Summary
+                model = session.exec(select(MLModelDB).where(MLModelDB.hf_model_id == repo_id)).first()
                 
-                if existing_model:
-                    # Update existing model with new metadata
-                    existing_model.tags = model_data["tags"]
-                    existing_model.task = model_data["task"]
-                    existing_model.description = model_data["description"]
-                    session.add(existing_model)
-                    stats["updated"] += 1
-                    logger.debug(f"Updated model: {hf_model_id}")
-                    
-                else:
-                    # Create new model
-                    new_model = MLModelDB(
-                        id=uuid.uuid4(),
-                        name=model_data["name"],
-                        slug=hf_model_id.lower().replace("/", "-"),
-                        description=model_data["description"] or f"LiteRT model from HuggingFace: {hf_model_id}",
-                        category=ModelCategory.UTILITY,  # Default category
-                        license_type=map_hf_license_to_enum(model_data["license"]),
-                        origin_repo_url=f"https://huggingface.co/{hf_model_id}",
-                        hf_model_id=hf_model_id,
-                        author_id=system_user.id,
-                        tags=model_data["tags"],
-                        task=model_data["task"],
-                        is_verified_official=False,
-                        total_download_count=0,
-                        rating_weighted_avg=0.0,
-                        total_ratings=0,
+                if not model:
+                    model = MLModelDB(
+                        name=repo_id.split("/")[-1].replace("-", " ").title(), # Format repo name nicely
+                        slug=repo_id.replace("/", "-").lower(),
+                        description=f"LiteRT model synced from Hugging Face from {repo_id}.",
+                        category=ModelCategory.UTILITY, # Default categorization
+                        author_id=system_author_id,
+                        hf_model_id=repo_id,
+                        task=task
                     )
-                    session.add(new_model)
-                    stats["created"] += 1
-                    logger.debug(f"Created new model: {hf_model_id}")
-                    
-            except sqlalchemy.exc.IntegrityError as e:
-                session.rollback()
-                logger.warning(f"Integrity error for {model_data['id']}: {e}")
-                stats["skipped"] += 1
+                    session.add(model)
+                    session.commit() # Commit early so we have the model.id for the version
+                    session.refresh(model)
+                    stats["models created"] += 1
+                else:
+                    # Optionally update dynamic fields like task if HF changed them
+                    model.task = task
+                    session.add(model)
+                    session.commit()
+                    stats["models updated"] += 1
+
+                # 3. Check for Existing Version
+                existing_version = session.exec(
+                    select(ModelVersionDB)
+                    .where(ModelVersionDB.model_id == model.id)
+                    .where(ModelVersionDB.commit_sha == commit_sha)
+                ).first()
+
+                if existing_version:
+                    print(f"[{repo_id}] Version {commit_sha[:7]} already exists. Skipping scanner.")
+                    stats["model versions skipped"] += 1
+                    continue
+
+                # 4. Invoke the Heuristic Scanner (Strategies 1 & 2)
+                version_payload = scan_hf_repo_for_version_assets(
+                    repo_id=repo_id, 
+                    commit_sha=commit_sha, 
+                    license_type=license_type
+                )
+
+                if not version_payload:
+                    print(f"[{repo_id}] No deployable TFLite assets found. Skipping version.")
+                    stats["model versions skipped"] += 1
+                    continue
+
+                # 5. Commit the Version to PostgreSQL
+                new_version = ModelVersionDB(
+                    model_id=model.id,
+                    version_name=version_payload["version_name"],
+                    commit_sha=version_payload["commit_sha"],
+                    is_hosted_by_us=version_payload["is_hosted_by_us"],
+                    assets=version_payload["assets"], # The strict JSONB dictionary
+                    pipeline_spec=version_payload.get("pipeline_spec"),
+                    license_type=version_payload["license_type"],
+                    is_commercial_safe=version_payload["is_commercial_safe"],
+                    requires_commercial_warning=version_payload["requires_commercial_warning"],
+                    file_size_bytes=version_payload["file_size_bytes"],
+                    status=version_payload["status"]
+                )
+
+                session.add(new_version)
+                session.commit()
+                print(f"[{repo_id}] Success! Added version {new_version.version_name} (Status: {new_version.status})")
+                stats["model versions created"] += 1
                 
             except Exception as e:
-                session.rollback()
-                logger.error(f"Error syncing model {model_data['id']}: {e}")
-                stats["skipped"] += 1
+                session.rollback() # Crucial: prevent one bad model from crashing the DB transaction state
+                print(f"[{repo_id}] Error syncing model: {e}")
+                stats["models skipped"] += 1
+            
+            # Rate limiting to respect Hugging Face API
+            #time.sleep(0.5) 
+            
+    print("Hugging Face Sync Job complete.")
+    return stats
+
+def sync_single_model_version(repo_id: str, commit_sha: str):
+    """
+    Utility function to sync a single model version by repo_id and commit_sha.
+    Useful for on-demand syncs or testing.
+    """
+    print(f"Starting sync of Hugging Face model {repo_id} at commit {commit_sha[:7]}...")
+    api = HfApi()
+    
+    # Query HF for models with a library of 'tflite'
+    hf_model = api.model_info(repo_id=repo_id, revision=commit_sha)
+
+    with Session(engine) as session:
+        system_author_id = get_or_create_system_user(session)
         
-        # Commit all changes
         try:
+            # 1. Parse Metadata
+            # 'pipeline_tag' is HF's official task categorization (e.g., 'image-classification')
+            task = getattr(hf_model, "pipeline_tag", "unknown") 
+            license_type = extract_tag_value(getattr(hf_model, "tags", []), "license:")
+            
+            # 2. Create or Update the Parent Model Summary
+            model = session.exec(select(MLModelDB).where(MLModelDB.hf_model_id == repo_id)).first()
+            
+            if not model:
+                model = MLModelDB(
+                    name=repo_id.split("/")[-1].replace("-", " ").title(), # Format repo name nicely
+                    slug=repo_id.replace("/", "-").lower(),
+                    description=f"LiteRT model synced from Hugging Face from {repo_id}.",
+                    category=ModelCategory.UTILITY, # Default categorization
+                    author_id=system_author_id,
+                    hf_model_id=repo_id,
+                    task=task
+                )
+                session.add(model)
+                session.commit() # Commit early so we have the model.id for the version
+                session.refresh(model)
+                logger.info(f"[{repo_id}] Created new model entry.")
+            else:
+                # Optionally update dynamic fields like task if HF changed them
+                model.task = task
+                session.add(model)
+                session.commit()
+                logger.info(f"[{repo_id}] Updated existing model entry.")
+
+            # 3. Check for Existing Version
+            existing_version = session.exec(
+                select(ModelVersionDB)
+                .where(ModelVersionDB.model_id == model.id)
+                .where(ModelVersionDB.commit_sha == commit_sha)
+            ).first()
+
+            if existing_version:
+                logger.info(f"[{repo_id}] Version {commit_sha[:7]} already exists. Skipping scanner.")
+                return
+
+            # 4. Invoke the Heuristic Scanner (Strategies 1 & 2)
+            version_payload = scan_hf_repo_for_version_assets(
+                repo_id=repo_id, 
+                commit_sha=commit_sha, 
+                license_type=license_type
+            )
+
+            if not version_payload:
+                logger.info(f"[{repo_id}] No deployable TFLite assets found. Skipping version.")
+                return
+
+            # 5. Commit the Version to PostgreSQL
+            new_version = ModelVersionDB(
+                model_id=model.id,
+                version_name=version_payload["version_name"],
+                commit_sha=version_payload["commit_sha"],
+                is_hosted_by_us=version_payload["is_hosted_by_us"],
+                assets=version_payload["assets"], # The strict JSONB dictionary
+                pipeline_spec=version_payload.get("pipeline_spec"),
+                license_type=version_payload["license_type"],
+                is_commercial_safe=version_payload["is_commercial_safe"],
+                requires_commercial_warning=version_payload["requires_commercial_warning"],
+                file_size_bytes=version_payload["file_size_bytes"],
+                status=version_payload["status"]
+            )
+
+            session.add(new_version)
             session.commit()
-            logger.info(f"Sync completed - Created: {stats['created']}, Updated: {stats['updated']}, Skipped: {stats['skipped']}")
+            logger.info(f"[{repo_id}] Success! Added version {new_version.version_name} (Status: {new_version.status})")
+            
         except Exception as e:
             session.rollback()
-            logger.error(f"Error committing transaction: {e}")
-            raise
+            logger.info(f"[{repo_id}] Error syncing model: {e}")
+            return
         
-        return stats
-
+        # Rate limiting to respect Hugging Face API
+        #time.sleep(0.5) 
+            
+    print("Hugging Face Sync Job complete.")
+    return
 
 def run_sync(limit: int = settings.HF_SYNC_FETCH_LIMIT) -> Dict[str, int]:
     """
@@ -218,11 +281,8 @@ def run_sync(limit: int = settings.HF_SYNC_FETCH_LIMIT) -> Dict[str, int]:
         logger.info("Starting HuggingFace LiteRT Model Sync")
         logger.info("=" * 60)
         
-        # Fetch models from HuggingFace
-        models = fetch_literrt_models(limit=limit)  # Adjust limit as needed
-        
         # Sync to database
-        stats = sync_literrt_models(models)
+        stats = sync_huggingface_models(limit=limit)
         
         logger.info("=" * 60)
         logger.info("HuggingFace LiteRT Model Sync Completed Successfully")
@@ -238,4 +298,4 @@ def run_sync(limit: int = settings.HF_SYNC_FETCH_LIMIT) -> Dict[str, int]:
 
 if __name__ == "__main__":
     # Run the sync manually for testing
-    run_sync()
+    run_sync(limit = 50)

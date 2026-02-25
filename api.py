@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, APIRouter, status
 from pydantic import BaseModel
 from enum import Enum
 from typing import List, Dict, Any, Optional
@@ -13,13 +13,25 @@ import requests
 from functools import lru_cache
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from fastapi import BackgroundTasks
 
-from schema import ModelCategory, AssetType, DevicePlatform, LicenseType, PipelineConfig, MLModelAsset, MLModelDB, UserDB, ModelVersionDB
 from database import engine, get_session
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from auth import get_current_user
-from hf_sync import run_sync
+from hf_sync import run_sync, sync_single_model_version
 from config import get_settings
+from generator import generate_pipeline_for_version, process_all_unconfigured
+from schema import (
+    MLModelDB, 
+    MLModelRead, 
+    MLModelCreate,
+    ModelVersionDB, 
+    ModelVersionRead, 
+    ModelVersionUpdate,
+    UserDB,
+    UserRead,
+    UserBase # Assuming UserBase is used for creation if you don't have UserCreate
+)
 
 # get .env configs
 settings = get_settings()
@@ -29,153 +41,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# user DTOs
-# user get
-class UsersResponse(BaseModel):
-    id: uuid.UUID
-    username: str
-    email: str
-    is_developer: bool
-    created_at: datetime
-    hf_username: Optional[str]
-    hf_verification_token: Optional[str] = None
-    hf_access_token: Optional[str] = None
-
-    class Config:
-        from_attributes = True
-
-# user post
-class UsersCreate(BaseModel):
-    username: str
-    email: str
-    hf_username: Optional[str]
-
-# user put
-class UsersUpdate(BaseModel):
-    username: Optional[str] = None
-    email: Optional[str] = None
-    hf_username: Optional[str] = None
-
-# model DTOs
-# model get
-class ModelResponse(BaseModel):
-    name: str
-    slug: Optional[str] = None
-    description: str | None
-    category: ModelCategory
-    id: uuid.UUID
-    author_id: uuid.UUID
-    tags: List[str]
-    task: str | None
-    license_type: LicenseType
-    total_download_count: int
-    rating_weighted_avg: float
-    total_ratings: int
-    created_at: datetime
-
-# model post
-class ModelCreate(BaseModel):
-    name: str
-    slug: Optional[str] = None
-    hf_model_id: Optional[str] = None
-    description: str | None = None
-    category: ModelCategory
-    tags: Optional[List[str]] = None
-    task: Optional[str] = None
-
-# model put
-class ModelUpdate(BaseModel):
-    name: Optional[str] = None
-    slug: Optional[str] = None
-    hf_model_id: Optional[str] = None
-    description: Optional[str | None] = None
-    category: Optional[ModelCategory] = None
-    tags: Optional[List[str]] = None
-    task: Optional[str] = None
-    total_download_count: Optional[int] = None
-
-# model version DTOs
-# model version get
-class ModelVerResponse(BaseModel):
-    id: uuid.UUID
-    version_string: str
-    changelog: Optional[str]
-    model_id: uuid.UUID
-    hf_commit_sha: Optional[str] = None
-    
-    # COMPLEX JSONB COLUMNS
-    pipeline_spec: PipelineConfig
-    assets: List[MLModelAsset]
-    
-    # Telemetry Aggregates
-    published_at: datetime
-    download_count: int
-    num_ratings: int
-    rating_avg: float
-
-# model version post
-class ModelVerCreate(BaseModel):
-    id: uuid.UUID
-    model_id: uuid.UUID
-    pipeline_spec: PipelineConfig
-    assets: List[MLModelAsset]
-    hf_commit_sha: Optional[str] = None
-
-# model version put
-class ModelVerUpdate(BaseModel):
-    id: uuid.UUID
-    model_id: uuid.UUID
-    hf_commit_sha: Optional[str] = None
-    pipeline_spec: Optional[PipelineConfig] = None
-    assets: Optional[List[MLModelAsset]] = None
-    download_count: Optional[int] = None
-    num_ratings: Optional[int] = None
-    rating_avg: Optional[float] = None
-
 # Input DTO for the HF Import Request
 class HFImportRequest(BaseModel):
     hf_id: str # e.g. "google/mobilenet_v2_1.0_224"
 
 
-# Initialize App
-app = FastAPI(
-    title="Pocket AI Lab API",
-    version="1.0.0",
-    openapi_tags = [
-        {
-            "name": "Users",
-        },
-        {
-            "name": "Models",
-        },
-        {
-            "name": "Model Versions",
-        },
-        {
-            "name": "Hugging Face",
-        }
-    ]
-)
-
-# CORS
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
-    expose_headers=["Content-Type", "Authorization"],
-    max_age=3600,
-)
+router = APIRouter()
 
 # ==========================================
 # SCHEDULER SETUP
@@ -183,7 +54,6 @@ app.add_middleware(
 # Initialize the background scheduler for HuggingFace model sync
 scheduler = BackgroundScheduler()
 
-@app.on_event("startup")
 def start_scheduler():
     """Start the background scheduler when FastAPI starts."""
     if not scheduler.running:
@@ -199,7 +69,6 @@ def start_scheduler():
         scheduler.start()
         logger.info("Background scheduler started - HF LiteRT sync scheduled for 02:00 UTC daily")
 
-@app.on_event("shutdown")
 def stop_scheduler():
     """Stop the scheduler when FastAPI shuts down."""
     if scheduler.running:
@@ -218,167 +87,234 @@ def get_valid_hf_tasks():
         pass
     return set() # Fallback
 
-### user endpoints
-# user get
-@app.get("/users/me", response_model=UsersResponse, tags=["Users"], summary="Get the currently logged-in user")
-async def get_user(current_user: UserDB = Depends(get_current_user)):
+# ==========================================
+# 0. USERS API
+# ==========================================
+
+@router.get("/users/me", response_model=UserRead, tags=["Users"])
+def get_current_user_profile(
+    current_user: UserDB = Depends(get_current_user)
+):
+    """
+    Fetch the profile of the currently authenticated user.
+    """
     return current_user
 
+@router.get("/users/{user_id}", response_model=UserRead, tags=["Users"])
+def get_user(user_id: uuid.UUID, session: Session = Depends(get_session),
+             current_user: UserDB = Depends(get_current_user)):
+    """Fetch a public user profile."""
+    user = session.get(UserDB, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
 
-### model endpoints
-# get a particular model
-@app.get("/models/{model_id}", response_model=ModelResponse, tags=["Models"], summary="Get a model summary by ID")
-async def get_model(model_id: uuid.UUID, session: Session = Depends(get_session)):
-    model_fetch = session.get(MLModelDB, model_id)
-    if not model_fetch:
-        raise HTTPException(status_code=404, detail="Model not found")
-    return ModelResponse(**model_fetch.model_dump(),
-        author_username=model_fetch.author.username)
+@router.post("/users", response_model=UserRead, status_code=status.HTTP_201_CREATED, tags=["Users"])
+def create_user(user_in: UserBase, session: Session = Depends(get_session),
+                current_user: UserDB = Depends(get_current_user)):
+    """
+    Create a new user. 
+    Typically called after a successful Supabase signup webhook or first login.
+    """
+    # Check for existing user
+    existing_user = session.exec(select(UserDB).where(UserDB.email == user_in.email)).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User with this email already exists")
 
-# get all models
-@app.get("/models", response_model=List[ModelResponse], tags=["Models"], summary="Get all model summaries")
-async def get_all_models(author_id: uuid.UUID | None = None,
-                         session: Session = Depends(get_session)):
-    statement = select(MLModelDB)
-    if author_id:
-        statement = statement.where(MLModelDB.author_id == author_id)
-    models = session.exec(statement).all()
+    new_user = UserDB.model_validate(user_in)
+    session.add(new_user)
+    session.commit()
+    session.refresh(new_user)
+    return new_user
+
+@router.get("/users/{user_id}/models", response_model=List[MLModelRead], tags=["Users"])
+def get_user_models(
+    user_id: uuid.UUID, 
+    skip: int = 0, 
+    limit: int = 50, 
+    session: Session = Depends(get_session),
+    current_user: UserDB = Depends(get_current_user)
+):
+    """
+    Convenience route: Fetch all top-level models authored by a specific user.
+    """
+    # Verify user exists
+    user = session.get(UserDB, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    query = select(MLModelDB).where(MLModelDB.author_id == user_id).offset(skip).limit(limit)
+    models = session.exec(query).all()
     return models
 
-# model post
-@app.post("/models/{model_id}", response_model=ModelResponse, tags=["Models"], summary="Create a new model")
-async def create_model(model_id: uuid.UUID,
-                       model_data: ModelCreate,
-                       current_user: UserDB = Depends(get_current_user),
-                       session: Session = Depends(get_session)):
-    model_fetch = session.get(MLModelDB, model_id)
-    if model_fetch:
-        raise HTTPException(status_code=409, detail="Model already exists")
-    # check if model task is a valid HF task, and warn if not
-    valid_tasks = get_valid_hf_tasks()
-    if model_data.task not in valid_tasks:
-        # Soft Warning
-        print(f"Warning: Unknown task '{model_data.task}'. Accepted anyway.")
+# ==========================================
+# 1. MODELS API
+# ==========================================
 
-    # add model_id to model_data
-    model_data.id = model_id
-    session.add(model_data)
-    try:
-        session.commit()
-    # throw a helpful conflict error if you try to write a value that already exists for a unique field
-    except sqlalchemy.exc.IntegrityError as e:
-        session.rollback()
-        raise HTTPException(status_code=409, detail=str(e))
-    session.refresh(model_data)
-    return model_data
+@router.get("/models", response_model=List[MLModelRead], tags=["Models"])
+def get_all_models(
+    skip: int = 0, 
+    limit: int = 1000, 
+    task: str = None, # Notice we query by string now, not Enum!
+    session: Session = Depends(get_session)
+):
+    """
+    Fetch the high-level model summaries.
+    We use query parameters for filtering, adhering to strict REST guidelines.
+    """
+    query = select(MLModelDB)
+    
+    if task:
+        query = query.where(MLModelDB.task == task)
+        
+    query = query.offset(skip).limit(limit)
+    models = session.exec(query).all()
+    return models
 
-# model update
-@app.patch("/models/{model_id}", response_model=ModelResponse, tags=["Models"], summary="Update a model via patch")
-async def update_model(model_id: uuid.UUID,
-                       model_data: ModelUpdate,
-                       current_user: UserDB = Depends(get_current_user),
-                       session: Session = Depends(get_session)):
-    # check if model exists
-    model_fetch = session.get(MLModelDB, model_id)
-    if not model_fetch:
+@router.get("/models/{model_id}", response_model=MLModelRead, tags=["Models"])
+def get_model(model_id: uuid.UUID, session: Session = Depends(get_session)):
+    """Fetch a specific model summary."""
+    model = session.get(MLModelDB, model_id)
+    if not model:
         raise HTTPException(status_code=404, detail="Model not found")
-    # update model data
-    model_data = model_data.model_dump(exclude_unset=True)
+    return model
+
+@router.post("/models", response_model=MLModelRead, status_code=status.HTTP_201_CREATED, tags=["Models"])
+def create_model(
+    model_in: MLModelCreate, 
+    session: Session = Depends(get_session),
+    current_user: UserDB = Depends(get_current_user)
+):
+    """Create a new top-level model resource."""
+    # Use the authenticated user as the author
+    author_id = current_user.id 
     
-    for key, value in model_data.items():
-        setattr(model_fetch, key, value)
+    new_model = MLModelDB.model_validate(model_in, update={"author_id": author_id})
+    session.add(new_model)
+    session.commit()
+    session.refresh(new_model)
+    return new_model
 
-    session.add(model_fetch)
-    try:
-        session.commit()
-    # throw a helpful conflict error if you try to write a value that already exists for a unique field
-    except sqlalchemy.exc.IntegrityError as e:
-        session.rollback()
-        raise HTTPException(status_code=409, detail=str(e))
-    session.refresh(model_fetch)
-    return model_fetch
+# ==========================================
+# 2. MODEL VERSIONS API 
+# ==========================================
 
-### model version endpoints
-# get a particular model version
-@app.get("/models/{model_id}/versions/{version_id}", response_model=ModelVerResponse, tags=["Model Versions"], summary="Get a model version summary by ID")
-async def get_model_version(model_id: uuid.UUID, 
-                            version_id: uuid.UUID,
-                            session: Session = Depends(get_session)):
-    # check if model version even exists
-    statement = select(ModelVersionDB).where(
-        ModelVersionDB.model_id == model_id,
-        ModelVersionDB.id == version_id
-    )
-    model_ver = session.exec(statement).one()
-    if not model_ver:
+@router.get("/models/{model_id}/versions", response_model=List[ModelVersionRead], tags=["Model Versions"])
+def get_model_versions(model_id: uuid.UUID, 
+                       session: Session = Depends(get_session)):
+    """
+    Fetch all versions for a specific model.
+    The response automatically maps the JSONB 'assets' column to the Pydantic AssetPointers model.
+    """
+    # Verify model exists
+    model = session.get(MLModelDB, model_id)
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+        
+    versions = session.exec(
+        select(ModelVersionDB).where(ModelVersionDB.model_id == model_id)
+    ).all()
+    
+    return versions
+
+@router.get("/versions/{version_id}", response_model=ModelVersionRead, tags=["Model Versions"])
+def get_version(version_id: uuid.UUID, session: Session = Depends(get_session)):
+    """Fetch a specific version and its dynamic asset pointers."""
+    version = session.get(ModelVersionDB, version_id)
+    if not version:
         raise HTTPException(status_code=404, detail="Model version not found")
-    # return model version data
-    return model_ver
+    return version
 
-# get all of a model's versions
-@app.get("/models/{model_id}/versions", response_model=List[ModelVerResponse], tags=["Model Versions"], summary="Get all model version summaries")
-async def get_all_versions(model_id: uuid.UUID,
-                           session: Session = Depends(get_session)):
-    statement = select(ModelVersionDB).where(ModelVersionDB.model_id == model_id)
-    model_versions = session.exec(statement).all()
-    return model_versions
+@router.patch("/versions/{version_id}", response_model=ModelVersionRead, tags=["Model Versions"])
+def update_model_version_config(
+    version_id: uuid.UUID,
+    payload: ModelVersionUpdate,
+    session: Session = Depends(get_session),
+    current_user: UserDB = Depends(get_current_user)
+):
+    """
+    Pocket AI Strategy 3: Crowdsourced Configuration Ingestion.
+    Accepts a rigorously validated pipeline_spec from the React UI and commits it.
+    """
+    # 1. Fetch the Target Version
+    version = session.get(ModelVersionDB, version_id)
+    if not version:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Model version not found."
+        )
 
-# model version post
-@app.post("/models/{model_id}/versions/{version_id}", response_model=ModelVerResponse, tags=["Model Versions"], summary="Create a new model version")
-async def create_model_version(model_id: uuid.UUID,
-                               version_id: uuid.UUID,
-                               model_ver_data: ModelVersionDB,
-                               current_user: UserDB = Depends(get_current_user),
-                               session: Session = Depends(get_session)):
-    # check if model version already exists
-    statement = select(ModelVersionDB).where(
-        ModelVersionDB.model_id == model_id,
-        ModelVersionDB.id == version_id
-    )
-    model_ver = session.exec(statement).all()
-    if model_ver:
-        raise HTTPException(status_code=409, detail="Model version already exists")
-    model_ver_data.model_id = model_id
-    model_ver_data.id = version_id
-    session.add(model_ver_data)
-    try:
-        session.commit()
-    # throw a helpful conflict error if you try to write a value that already exists for a unique field
-    except sqlalchemy.exc.IntegrityError as e:
-        session.rollback()
-        raise HTTPException(status_code=409, detail=str(e))
-    session.refresh(model_ver_data)
-    return model_ver_data
+    # 2. Safely Update Pipeline Spec (Only if provided in the PATCH payload)
+    if payload.pipeline_spec is not None:
+        # Pydantic safely converts the complex PipelineConfig object to a basic dict for Postgres
+        version.pipeline_spec = payload.pipeline_spec.model_dump(mode='json')
 
-# model version update
-@app.patch("/models/{model_id}/versions/{version_id}", response_model=ModelVerResponse, tags=["Model Versions"], summary="Update a model version via patch")
-async def update_model_version(model_id: uuid.UUID,
-                               version_id: uuid.UUID,
-                               model_ver_data: ModelVerUpdate,
-                               current_user: UserDB = Depends(get_current_user),
-                               session: Session = Depends(get_session)):
-    # check if model version already exists
-    statement = select(ModelVersionDB).where(
-        ModelVersionDB.model_id == model_id,
-        ModelVersionDB.id == version_id
-    )
-    model_ver = session.exec(statement).one()
-    if not model_ver:
-        raise HTTPException(status_code=409, detail="Model version doesn't exist")
-    update_data = model_ver_data.model_dump(exclude_unset=True)
+    # 3. Safely Update Status (Only if provided)
+    if payload.status is not None:
+        version.status = payload.status
+
+    # 4. Commit to Postgres
+    session.add(version)
+    session.commit()
+    session.refresh(version)
+
+    return version
+
+# generate a pipeline config for a specific model version
+@router.post("/versions/{version_id}/generate-pipeline", response_model=ModelVersionRead, tags=["Model Versions"])
+def trigger_pipeline_generation(
+    version_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    current_user: UserDB = Depends(get_current_user)
+):
+    """
+    Manually triggers the LLM to generate a pipeline config for a specific model version.
+    """
+    # 1. Fetch the Target Version and Parent Model
+    version = session.get(ModelVersionDB, version_id)
+    if not version:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Model version not found."
+        )
+        
+    model = session.get(MLModelDB, version.model_id)
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Parent model not found."
+        )
+
+    # 2. Call the generator helper
+    success = generate_pipeline_for_version(version, model, session)
     
-    for key, value in update_data.items():
-        setattr(model_ver, key, value)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="LLM generation failed. Please check the server logs."
+        )
+        
+    # 3. Refresh and return the updated version
+    session.refresh(version)
+    return version
 
-    session.add(model_ver)
-    try:
-        session.commit()
-    # throw a helpful conflict error if you try to write a value that already exists for a unique field
-    except sqlalchemy.exc.IntegrityError as e:
-        session.rollback()
-        raise HTTPException(status_code=409, detail=str(e))
-    session.refresh(model_ver)
-    return model_ver
+@router.post("/versions/generate-pipeline-all", tags=["Model Versions"])
+def trigger_pipeline_generation_all(
+    background_tasks: BackgroundTasks,
+    # current_user: UserDB = Depends(get_current_user) # CRITICAL: Restrict this to admins later!
+):
+    """
+    Kicks off a background job to scan the database for all 'unconfigured' 
+    model versions and generate their pipelines using the LLM.
+    """
+    # FastAPI will pass this function to a background worker and return the HTTP response immediately
+    background_tasks.add_task(process_all_unconfigured)
+    
+    return {
+        "message": "Batch pipeline generation started in the background. Check server logs for progress.",
+        "status": "processing"
+    }
+
 
 # Search HF for models with TFLite files
 class HFSearchResult(BaseModel):
@@ -390,7 +326,7 @@ class HFSearchResult(BaseModel):
 class HFSearchResponse(BaseModel):
     results: List[HFSearchResult]
 
-@app.get("/search/huggingface", response_model=HFSearchResponse, tags=["Hugging Face"], summary="Search Hugging Face for TFLite models")
+@router.get("/search/huggingface", response_model=HFSearchResponse, tags=["Hugging Face"], summary="Search Hugging Face for TFLite models")
 def search_huggingface(query: str, 
                        ):
     """
@@ -468,90 +404,6 @@ def search_huggingface(query: str,
         else:
             raise HTTPException(status_code=500, detail=f"Failed to search Hugging Face: {error_msg[:100]}")
 
-# create a model from HF
-@app.post("/import/huggingface", response_model=ModelResponse, tags=["Hugging Face"], summary="Import a model directly from Hugging Face")
-def import_from_huggingface(
-    payload: HFImportRequest,
-    user: UserDB = Depends(get_current_user),
-    session: Session = Depends(get_session)
-):
-    api = HfApi()
-    
-    # 1. Fetch Model Info from HF
-    try:
-        model_info = api.model_info(repo_id=payload.hf_id, files_metadata=True)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Hugging Face repo not found")
-
-    # 2. FILTER: Ensure it is a TFLite model
-    tflite_files = [f for f in model_info.siblings if f.rfilename.endswith(".tflite")]
-    
-    if not tflite_files:
-        raise HTTPException(status_code=400, detail="No .tflite files found in this repo")
-
-    # 3. Create the Parent Model (Mapping Logic)
-    # Map HF tags to our tags
-    hf_tags = model_info.tags or []
-    #our_tags = [t for t in hf_tags if t in ["vision", "audio", "text"]] # Simple filter
-    
-    # Map License (data schema uses HF's license strings directly)
-    license_str = model_info.cardData.get("license", "unknown")
-    license_enum = LicenseType(license_str) if license_str in LicenseType.__members__ else LicenseType.UNKNOWN
-    
-    new_model = MLModelDB(
-        name=payload.hf_id.title(), # "mobilenet-v2"
-        slug=payload.hf_id.replace("/", "-"),
-        description=f"Imported from Hugging Face: {payload.hf_id}",
-        category=ModelCategory.OTHER, # You might want to guess this based on tags
-        license_type=license_enum,
-        origin_repo_url=f"https://huggingface.co/{payload.hf_id}",
-        hf_model_id=payload.hf_id, # <--- STORE THE ID
-        author_id=user.id,
-        tags=hf_tags,
-        task=model_info.pipeline_tag
-    )
-    
-    session.add(new_model)
-    # session.flush() # Generate ID
-
-    # # 4. Create the Version (Asset Mapping)
-    # # We take the first TFLite file found (or you could loop through them)
-    # primary_file = tflite_files[0]
-    
-    # # Generate the direct download URL (CDN)
-    # download_url = hf_hub_url(
-    #     repo_id=payload.hf_id, 
-    #     filename=primary_file.rfilename, 
-    #     revision=model_info.sha
-    # )
-
-    # assets = [
-    #     MLModelAsset(
-    #         asset_key="model_file",
-    #         asset_type=AssetType.TFLite,
-    #         source_url=download_url, # Direct link to HF CDN
-    #         file_size_bytes=0, # HF API usually provides this in 'lfs' metadata, requires deeper check
-    #         file_hash=model_info.sha, # Use commit SHA as proxy for hash initially
-    #         is_hosted_by_us=False # Important!
-    #     )
-    # ]
-
-    # new_version = ModelVersionDB(
-    #     model_id=new_model.id,
-    #     version_string="1.0.0",
-    #     hf_commit_sha=model_info.sha, # <--- STORE THE SHA
-    #     pipeline_spec=PipelineConfig(input_nodes=[], output_nodes=[]), # Empty placeholder
-    #     assets=[a.dict() for a in assets],
-    #     published_at=datetime.now(UTC)
-    # )
-
-    # session.add(new_version)
-    # session.commit()
-    session.refresh(new_model)
-    
-    return new_model
-
-
 # ==========================================
 # HUGGINGFACE LITERT SYNC ENDPOINT
 # ==========================================
@@ -562,7 +414,7 @@ class SyncResponse(BaseModel):
     skipped: int
     message: str
 
-@app.post("/sync/huggingface/litert", response_model=SyncResponse, tags=["Hugging Face"], summary="Manually trigger HuggingFace LiteRT model sync")
+@router.post("/sync/huggingface/litert", response_model=SyncResponse, tags=["Hugging Face"], summary="Manually trigger HuggingFace LiteRT model sync")
 def manual_sync_literrt_models(current_user: UserDB = Depends(get_current_user)):
     """
     Manually trigger the HuggingFace LiteRT model sync job.
@@ -584,3 +436,23 @@ def manual_sync_literrt_models(current_user: UserDB = Depends(get_current_user))
     except Exception as e:
         logger.error(f"Error during manual sync: {e}")
         raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
+    
+@router.post("/sync/huggingface/litert/adhoc", tags=["Hugging Face"], summary="Manually trigger sync for a specific HF repo and commit")
+def manual_sync_specific_version(
+    repo_id: str, 
+    commit_sha: str, 
+    current_user: UserDB = Depends(get_current_user)
+):
+    """
+    Manually trigger the sync process for a specific Hugging Face repository and commit.
+    Useful for testing or force-syncing a single model version outside the scheduled job.
+    """
+    try:
+        logger.info(f"Manual sync for repo: {repo_id}, commit: {commit_sha} triggered by user: {current_user.username}")
+        sync_single_model_version(repo_id=repo_id, commit_sha=commit_sha)
+        
+        return {"status": "success", "message": f"Manual sync for {repo_id} at {commit_sha[:7]} completed. Check logs for details."}
+        
+    except Exception as e:
+        logger.error(f"Error during manual sync for {repo_id} at {commit_sha}: {e}")
+        raise HTTPException(status_code=500, detail=f"Manual sync failed: {str(e)}")
