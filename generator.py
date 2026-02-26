@@ -99,16 +99,32 @@ def generate_pipeline_config(task: str, readme_text: str, metadata_text: str, mo
     
     CRITICAL INSTRUCTION:
     It is likely you will be given models for tasks we do not yet support (like Audio, NLP) or models requiring complex custom preprocessing not defined in our schema.
-    If the model cannot be PERFECTLY configured using our exact schema, you MUST set 'is_supported' to false, explain why in 'reasoning', and leave 'config' null.
+    If the model cannot be PERFECTLY configured using our exact schema, you MUST set 'is_supported' to false, briefly explain why in 'reasoning', and leave 'config' null.
     
     Instructions if supported:
     1. TENSORS: explicitly define 'inputs' and 'outputs' using exact tensor names, shapes, and dtypes.
     2. ROUTING: 'input_name' and 'source_tensors' must match the defined tensors.
-    3. PREPROCESSING/POSTPROCESSING: Infer the correct steps based on the '{task}'.
-    4. You MUST map requirements ONLY to the exact structures and allowed literals defined in the schema.
+    3. PREPROCESSING: Create a LIST of PreprocessBlock objects. Each block has:
+       - input_name: str (name of the input tensor)
+       - expects_type: Literal["image", "audio", "text"]
+       - steps: List of PreprocessStep objects
+    4. POSTPROCESSING: Create a LIST of PostprocessBlock objects. Each block has:
+       - output_name: str (logical name for the output)
+       - interpretation: str (e.g., 'classification_scores')
+       - source_tensors: List of output tensor names
+       - coordinate_format: Optional[str] (for detection models)
+       - steps: List of PostprocessStep objects
+    5. You MUST map requirements ONLY to the exact structures and allowed literals defined in the schema.
     """
 
     user_prompt = f"""
+    Analyze this model and generate a complete, valid PipelineConfig with ALL required fields:
+    - metadata: A list with one MetadataBlock containing model info
+    - inputs: A list of TensorDefinition objects for all input tensors
+    - outputs: A list of TensorDefinition objects for all output tensors  
+    - preprocessing: A LIST of PreprocessBlock objects (each block contains input_name, expects_type, and steps)
+    - postprocessing: A LIST of PostprocessBlock objects (each block contains output_name, interpretation, source_tensors, and steps)
+    
     --- TFLITE METADATA ---
     {metadata_text}
     
@@ -140,7 +156,7 @@ def generate_pipeline_config(task: str, readme_text: str, metadata_text: str, mo
         return None
     
 
-def generate_pipeline_for_version(version: ModelVersionDB, model: MLModelDB, session: Session) -> bool:
+def run_generator_for_version(version: ModelVersionDB, model: MLModelDB, session: Session) -> bool:
     """
     Executes the pipeline generation for a single version and commits to DB.
     Returns True if generation was successfully processed (even if unsupported), False if it failed.

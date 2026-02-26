@@ -20,7 +20,7 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select
 from auth import get_current_user
 from hf_sync import run_sync, sync_single_model_version
 from config import get_settings
-from generator import generate_pipeline_for_version, process_all_unconfigured
+from generator import run_generator_for_version, process_all_unconfigured
 from schema import (
     MLModelDB, 
     MLModelRead, 
@@ -155,7 +155,8 @@ def get_user_models(
 def get_all_models(
     skip: int = 0, 
     limit: int = 1000, 
-    task: str = None, # Notice we query by string now, not Enum!
+    task: str = None,
+    supported_only: bool = False,
     session: Session = Depends(get_session)
 ):
     """
@@ -166,7 +167,10 @@ def get_all_models(
     
     if task:
         query = query.where(MLModelDB.task == task)
-        
+
+    if supported_only:
+        query = query.join(ModelVersionDB).where(ModelVersionDB.is_supported == True).distinct()
+
     query = query.offset(skip).limit(limit)
     models = session.exec(query).all()
     return models
@@ -194,6 +198,7 @@ def create_model(
     session.commit()
     session.refresh(new_model)
     return new_model
+
 
 # ==========================================
 # 2. MODEL VERSIONS API 
@@ -286,7 +291,7 @@ def trigger_pipeline_generation(
         )
 
     # 2. Call the generator helper
-    success = generate_pipeline_for_version(version, model, session)
+    success = run_generator_for_version(version, model, session)
     
     if not success:
         raise HTTPException(
@@ -301,7 +306,7 @@ def trigger_pipeline_generation(
 @router.post("/versions/generate-pipeline-all", tags=["Model Versions"])
 def trigger_pipeline_generation_all(
     background_tasks: BackgroundTasks,
-    # current_user: UserDB = Depends(get_current_user) # CRITICAL: Restrict this to admins later!
+    current_user: UserDB = Depends(get_current_user)
 ):
     """
     Kicks off a background job to scan the database for all 'unconfigured' 

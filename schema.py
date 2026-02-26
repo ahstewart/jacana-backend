@@ -6,7 +6,7 @@ from pydantic import BaseModel as PydanticBaseModel
 from sqlmodel import SQLModel, Field, Relationship
 from sqlalchemy import Column
 from sqlalchemy.dialects.postgresql import JSONB
-from pipeline_schema import PipelineConfig
+from pipeline_schema import PipelineConfig, PreprocessBlock, PostprocessBlock
 
 # ==========================================
 # 0. HELPERS
@@ -33,19 +33,7 @@ class DevicePlatform(str, Enum):
 # 2. JSON COMPONENTS (The "Inner" Data)
 # ==========================================
 # Strict validation for our Dart/Flutter engine execution
-
-class PipelineStep(PydanticBaseModel):
-    # Matches the React UI state exactly (e.g., "resize_image", "normalize")
-    step: str 
-    params: Dict[str, Any] = {}
-
-class PipelineConfig(PydanticBaseModel):
-    # Matches the React UI state (no underscores)
-    preprocessing: List[PipelineStep] = []
-    postprocessing: List[PipelineStep] = []
-    # Can be added later when we extract flatbuffer data:
-    input_nodes: Optional[List[str]] = None
-    output_nodes: Optional[List[str]] = None
+# (PipelineConfig and related classes are imported from pipeline_schema.py)
 
 # 1. Define the Strict Asset Contract
 class AssetPointers(PydanticBaseModel):
@@ -197,6 +185,8 @@ class ModelVersionRead(PydanticBaseModel):
     download_count: int
     num_ratings: int
     rating_avg: float
+    is_supported: bool
+    unsupported_reason: Optional[str] = None
 
 class ModelVersionUpdate(PydanticBaseModel):
     # This invokes our strict PipelineConfig rules
