@@ -118,6 +118,9 @@ class MLModelRead(PydanticBaseModel):
     description: str
     category: ModelCategory = ModelCategory.UTILITY
     tags: List[str]
+    task: Optional[str] = None
+    hf_model_id: Optional[str] = None
+    is_verified_official: bool = False
     total_download_count: int
     total_ratings: int
     rating_weighted_avg: float

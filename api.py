@@ -14,6 +14,7 @@ from functools import lru_cache
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import BackgroundTasks
+from fastapi.responses import RedirectResponse
 
 from database import engine, get_session
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -264,6 +265,52 @@ def update_model_version_config(
     session.refresh(version)
 
     return version
+
+@router.get("/versions/{version_id}/download/{asset_key}", tags=["Model Versions", "Downloads"])
+def download_model_asset(
+    version_id: uuid.UUID,
+    asset_key: str,
+    session: Session = Depends(get_session)
+):
+    """
+    Download a specific asset (e.g., 'tflite', 'labels') for a model version.
+    This endpoint resolves the asset's storage location and redirects the client,
+    allowing us to track telemetry and abstract the underlying storage provider.
+    """
+    # 1. Fetch the Target Version
+    version = session.get(ModelVersionDB, version_id)
+    if not version:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Model version not found."
+        )
+
+    # 2. Check if the requested asset exists
+    asset_url = version.assets.get(asset_key)
+    if not asset_url:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail=f"Asset '{asset_key}' not found for this version."
+        )
+
+    # 3. Telemetry: Increment download counts 
+    # We only increment if they download the main binary, not just a label file.
+    if asset_key == "tflite":
+        version.download_count += 1
+        session.add(version)
+        
+        # Also increment parent model download count
+        model = session.get(MLModelDB, version.model_id)
+        if model:
+            model.total_download_count += 1
+            session.add(model)
+            
+        session.commit()
+
+    # 4. Redirect the client directly to the storage provider (Hugging Face, S3, etc.)
+    # Using a 307 Temporary Redirect ensures the client follows the redirect to fetch the file
+    # but doesn't permanently cache the resolution, so you can change storage providers later.
+    return RedirectResponse(url=asset_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 # generate a pipeline config for a specific model version
 @router.post("/versions/{version_id}/generate-pipeline", response_model=ModelVersionRead, tags=["Model Versions"])
