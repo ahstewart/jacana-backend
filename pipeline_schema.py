@@ -15,7 +15,7 @@ class MetadataBlock(BaseModel):
 class TensorDefinition(BaseModel):
     name: str = Field(description="The exact name of the tensor.")
     shape: List[int] = Field(description="The tensor shape, e.g., [1, 224, 224, 3].")
-    dtype: Literal["float32", "uint8", "int8"] = Field(description="The data type of the tensor.")
+    dtype: Literal["float32", "uint8", "int8", "int32"] = Field(description="The data type of the tensor. Use int32 for token ID tensors in text generation models.")
 
 # ==========================================
 # 2. PREPROCESSING PARAMS
@@ -65,15 +65,39 @@ class ApplyNMSParams(BaseModel):
     score_tensor: str
 
 # ==========================================
+# TEXT GENERATION PARAMS
+# ==========================================
+class TokenizeParams(BaseModel):
+    max_length: int = Field(default=512, description="Maximum sequence length after tokenization.")
+    padding: bool = Field(default=True, description="Pad sequences shorter than max_length.")
+    truncation: bool = Field(default=True, description="Truncate sequences longer than max_length.")
+    add_special_tokens: bool = Field(default=True, description="Add model-specific special tokens (e.g. [CLS]/[SEP] for BERT, <s>/</s> for RoBERTa).")
+    vocab_file: Optional[str] = Field(default=None, description="Filename for vocab.txt (WordPiece/BERT-style). Auto-detected if omitted.")
+    tokenizer_file: Optional[str] = Field(default=None, description="Filename for tokenizer.json (HuggingFace BPE format). Auto-detected if omitted.")
+
+class GenerateParams(BaseModel):
+    mode: Literal["single_pass", "autoregressive"] = Field(
+        default="single_pass",
+        description="single_pass: model runs once and outputs the full sequence (seq2seq). autoregressive: decode loop, model runs repeatedly appending one token at a time (causal LM)."
+    )
+    max_new_tokens: int = Field(default=128, description="Maximum number of tokens to generate (autoregressive only).")
+    temperature: float = Field(default=1.0, description="Sampling temperature. 1.0 = neutral, <1.0 = sharper, >1.0 = more random.")
+    do_sample: bool = Field(default=False, description="If False, use greedy decoding (argmax). If True, use temperature sampling.")
+    eos_token_id: Optional[int] = Field(default=None, description="Token ID that signals end of generation. Generation stops when this token is produced.")
+
+class DecodeTokensParams(BaseModel):
+    skip_special_tokens: bool = Field(default=True, description="Remove special tokens (e.g. [CLS], [SEP], <pad>) from the decoded output string.")
+
+# ==========================================
 # 4. THE STEP WRAPPERS
 # ==========================================
 class PreprocessStep(BaseModel):
-    step: Literal["resize_image", "normalize", "format"]
-    params: Union[ResizeImageParams, NormalizeParams, FormatParams]
+    step: Literal["resize_image", "normalize", "format", "tokenize"]
+    params: Union[ResizeImageParams, NormalizeParams, FormatParams, TokenizeParams]
 
 class PostprocessStep(BaseModel):
-    step: Literal["apply_activation", "map_labels", "filter_by_score", "decode_boxes", "apply_nms"]
-    params: Union[ApplyActivationParams, MapLabelsParams, FilterByScoreParams, DecodeBoxesParams, ApplyNMSParams]
+    step: Literal["apply_activation", "map_labels", "filter_by_score", "decode_boxes", "apply_nms", "generate", "decode_tokens"]
+    params: Union[ApplyActivationParams, MapLabelsParams, FilterByScoreParams, DecodeBoxesParams, ApplyNMSParams, GenerateParams, DecodeTokensParams]
 
 # ==========================================
 # 5. THE MASTER CONFIGURATION BLOCKS

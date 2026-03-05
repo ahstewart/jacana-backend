@@ -92,29 +92,66 @@ def generate_pipeline_config(task: str, readme_text: str, metadata_text: str, mo
     a strict JSON object matching our PipelineGenerationResult wrapper.
     """
     system_prompt = f"""
-    You are an expert Edge AI engineer responsible for writing metadata files for AI models. These files will be used to run inference on these models on edge devices. 
+    You are an expert Edge AI engineer responsible for writing metadata files for AI models. These files will be used to run inference on these models on edge devices.
     Your job is to analyze the following Hugging Face Model Card, README, and TFLite Metadata for the AI model, and generate a strict configuration file for mobile deployment.
-    
+
     Model Task: {task}
-    
+
     CRITICAL INSTRUCTION:
-    It is likely you will be given models for tasks we do not yet support (like Audio, NLP) or models requiring complex custom preprocessing not defined in our schema.
     If the model cannot be PERFECTLY configured using our exact schema, you MUST set 'is_supported' to false, briefly explain why in 'reasoning', and leave 'config' null.
-    
+    Reject models requiring: audio processing, complex custom C++ ops, segmentation, or multi-modal inputs.
+
     Instructions if supported:
     1. TENSORS: explicitly define 'inputs' and 'outputs' using exact tensor names, shapes, and dtypes.
+       - CRITICAL: Tensor shapes MUST come ONLY from the TFLite metadata (the input/output tensor definitions in the embedded FlatBuffer). Do NOT use values like n_ctx, max_position_embeddings, or max_length from config.json or the README — these describe the original PyTorch model's capacity, which may be larger than what was baked into the TFLite export. The TFLite metadata is the single source of truth for shape.
+       - Use dtype "int32" for token ID tensors (text generation models).
+       - Use dtype "float32" for logit/score tensors.
     2. ROUTING: 'input_name' and 'source_tensors' must match the defined tensors.
     3. PREPROCESSING: Create a LIST of PreprocessBlock objects. Each block has:
        - input_name: str (name of the input tensor)
        - expects_type: Literal["image", "audio", "text"]
        - steps: List of PreprocessStep objects
+
+       For TEXT GENERATION models, use expects_type "text" and a single "tokenize" step:
+         step: "tokenize"
+         params: {{max_length: <N>, padding: true, truncation: true, add_special_tokens: true}}
+         where max_length MUST equal the sequence dimension from the TFLite input tensor shape (e.g. if input shape is [1, 64], use max_length: 64).
+
     4. POSTPROCESSING: Create a LIST of PostprocessBlock objects. Each block has:
        - output_name: str (logical name for the output)
-       - interpretation: str (e.g., 'classification_scores')
+       - interpretation: str — use "text_generation" for all text generation models
        - source_tensors: List of output tensor names
-       - coordinate_format: Optional[str] (for detection models)
+       - coordinate_format: Optional[str] (for detection models only)
        - steps: List of PostprocessStep objects
+
+       For SINGLE-PASS seq2seq models (e.g., translation, summarization — model outputs full token ID sequence in one call):
+         steps:
+           - step: "decode_tokens", params: {{skip_special_tokens: true}}
+
+       For AUTOREGRESSIVE causal LM models (e.g., GPT-style — model outputs logits and must be called in a decode loop):
+         steps:
+           - step: "generate", params: {{mode: "autoregressive", max_new_tokens: 128, temperature: 1.0, do_sample: false, eos_token_id: <EOS_ID>}}
+           - step: "decode_tokens", params: {{skip_special_tokens: true}}
+
     5. You MUST map requirements ONLY to the exact structures and allowed literals defined in the schema.
+
+    EXAMPLE — single-pass seq2seq (T5-style translation, input/output are token IDs):
+    {{
+      "metadata": [{{"model_task": "text_generation", ...}}],
+      "inputs": [{{"name": "input_ids", "shape": [1, 128], "dtype": "int32"}}],
+      "outputs": [{{"name": "output_ids", "shape": [1, 128], "dtype": "int32"}}],
+      "preprocessing": [{{"input_name": "input_ids", "expects_type": "text", "steps": [{{"step": "tokenize", "params": {{"max_length": 128, "padding": true, "truncation": true, "add_special_tokens": true}}}}]}}],
+      "postprocessing": [{{"output_name": "generated_text", "interpretation": "text_generation", "source_tensors": ["output_ids"], "steps": [{{"step": "decode_tokens", "params": {{"skip_special_tokens": true}}}}]}}]
+    }}
+
+    EXAMPLE — autoregressive causal LM (GPT-2 style, outputs logits over vocab):
+    {{
+      "metadata": [{{"model_task": "text_generation", ...}}],
+      "inputs": [{{"name": "input_ids", "shape": [1, 512], "dtype": "int32"}}],
+      "outputs": [{{"name": "logits", "shape": [1, 512, 50257], "dtype": "float32"}}],
+      "preprocessing": [{{"input_name": "input_ids", "expects_type": "text", "steps": [{{"step": "tokenize", "params": {{"max_length": 512, "padding": false, "truncation": true, "add_special_tokens": true}}}}]}}],
+      "postprocessing": [{{"output_name": "generated_text", "interpretation": "text_generation", "source_tensors": ["logits"], "steps": [{{"step": "generate", "params": {{"mode": "autoregressive", "max_new_tokens": 128, "temperature": 1.0, "do_sample": false, "eos_token_id": 50256}}}}, {{"step": "decode_tokens", "params": {{"skip_special_tokens": true}}}}]}}]
+    }}
     """
 
     user_prompt = f"""
@@ -281,4 +318,4 @@ def process_all_unconfigured():
 
 if __name__ == "__main__":
     #process_all_unconfigured()
-    run_generator_for_huggingface_model(repo_id="byoussef/MobileNetV4_Conv_Small_TFLite_224", commit_sha="ca1cd2705679b77b6e7008e67161d1276913bfc3")
+    run_generator_for_huggingface_model(repo_id="openai-community/gpt2", commit_sha="607a30d783dfa663caf39e06633721c8d4cfcd7e")
