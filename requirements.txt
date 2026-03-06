@@ -16,3 +16,4 @@ PyYAML
 httpx
 google-genai
 tflite-support
+ai-edge-litert

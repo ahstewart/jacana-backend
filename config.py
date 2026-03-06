@@ -27,6 +27,22 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     PIPELINE_GENERATION_MODEL: str = "gemini-2.0-flash"
 
+    # Pipeline generation
+    # Validation mode: "strict" | "loose" | "none"
+    #   strict — pipeline must pass invoke() to be stored; failures mark version unsupported
+    #   loose  — validation runs for shape correction; invoke() failures are stored with validation_status="not_validated"
+    #   none   — skip validation entirely; pipeline is stored as-is
+    PIPELINE_VALIDATION_MODE: str = "strict"
+    MAX_VALIDATION_RETRIES: int = 2
+    MAX_GENERATOR_WORKERS: int = 5
+    MAX_VALIDATOR_DOWNLOAD_MB: int = 150
+
+    # Timeouts (seconds)
+    LLM_TIMEOUT_SECONDS: int = 120
+    TFLITE_INVOKE_TIMEOUT_SECONDS: int = 30
+    HF_FETCH_TIMEOUT_SECONDS: int = 15       # Per-chunk read timeout for small API calls
+    TFLITE_DOWNLOAD_TIMEOUT_SECONDS: int = 120  # Total budget for downloading a .tflite file
+
 
 
 # Use lru_cache so we only read the file once per startup

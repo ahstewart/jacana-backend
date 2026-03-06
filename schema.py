@@ -147,17 +147,16 @@ class ModelVersionBase(SQLModel):
     requires_commercial_warning: bool = False
     file_size_bytes: int = 0
     
-    # State tracking ("unconfigured" vs "configured")
-    status: str = Field(default="unconfigured", index=True)
+    # State tracking ("unsupported", "unverified", "supported", "broken")
+    status: str = Field(default="unsupported", index=True)
     changelog: Optional[str] = None
 
 class ModelVersionDB(ModelVersionBase, table=True):
     __tablename__ = "model_versions"
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     model_id: uuid.UUID = Field(foreign_key="ml_models.id")
-    
+
     pipeline_spec: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB))
-    is_supported: bool = Field(default=False)
     unsupported_reason: Optional[str] = None
 
     published_at: datetime = Field(default_factory=utc_now)
@@ -191,7 +190,6 @@ class ModelVersionRead(PydanticBaseModel):
     download_count: int
     num_ratings: int
     rating_avg: float
-    is_supported: bool
     unsupported_reason: Optional[str] = None
 
 class ModelVersionUpdate(PydanticBaseModel):

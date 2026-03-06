@@ -1,19 +1,27 @@
 import os
+import time
 import tempfile
+import logging
 import httpx
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pydantic import ValidationError, BaseModel, Field
 from typing import Optional
 from sqlmodel import Session, select
 from huggingface_hub import HfApi
 from google import genai
 from google.genai import types
-from tflite_support import metadata 
+from tflite_support import metadata
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # Database and Schema import
 from database import engine
 from schema import MLModelDB, ModelVersionDB
 from pipeline_schema import PipelineConfig
 from config import get_settings
+from validator import validate_and_correct_pipeline
+
 
 # Load environment variables (ensure OPENAI_API_KEY is in your .env file)
 settings = get_settings()
@@ -32,61 +40,85 @@ def fetch_hf_readme(repo_id: str, commit_sha: str) -> str:
     Fetches the README.md (Model Card) directly from the Hugging Face repo.
     """
     api = HfApi()
+    url = f"https://huggingface.co/{repo_id}/resolve/{commit_sha}/README.md"
+    logger.debug("Fetching README: %s", url)
     try:
-        # Download the raw README.md file from the specific commit
-        url = f"https://huggingface.co/{repo_id}/resolve/{commit_sha}/README.md"
-        response = httpx.get(url, timeout=10.0, follow_redirects=True)
-        
+        response = httpx.get(url, timeout=settings.HF_FETCH_TIMEOUT_SECONDS, follow_redirects=True)
         if response.status_code == 200:
+            logger.debug("README fetched (%d chars)", len(response.text))
             return response.text
+        logger.warning("README not found for %s (HTTP %d)", repo_id, response.status_code)
         return "No README found."
     except Exception as e:
-        print(f"Warning: Failed to fetch README for {repo_id}: {e}")
+        logger.warning("Failed to fetch README for %s: %s", repo_id, e)
         return "Failed to fetch README."
 
 def fetch_hf_model_card(repo_id: str) -> str:
     """
-    Fetches the structured Model Card metadata (YAML frontmatter and tags) 
+    Fetches the structured Model Card metadata (YAML frontmatter and tags)
     from the Hugging Face Hub API.
     """
     api = HfApi()
+    logger.debug("Fetching model card for %s...", repo_id)
     try:
         info = api.model_info(repo_id=repo_id)
-        # cardData contains the structured YAML frontmatter of the model card
         card_data = getattr(info, 'cardData', {})
-        return str(card_data) if card_data else "No structured Model Card data found."
+        result = str(card_data) if card_data else "No structured Model Card data found."
+        logger.debug("Model card fetched (%d chars)", len(result))
+        return result
     except Exception as e:
-        print(f"Warning: Failed to fetch Model Card for {repo_id}: {e}")
+        logger.warning("Failed to fetch model card for %s: %s", repo_id, e)
         return "Failed to fetch Model Card data."
 
 def fetch_tflite_metadata(tflite_url: str) -> str:
     """
     Attempts to download the TFLite file and extract embedded FlatBuffer metadata.
     """
+    logger.debug("Downloading TFLite for metadata extraction: %s", tflite_url)
     try:
-        # We only download the model to a temporary file just for this extraction
         with tempfile.NamedTemporaryFile(delete=False, suffix=".tflite") as tmp_file:
-            print(f"  -> Downloading TFLite binary for metadata extraction...")
-            with httpx.stream("GET", tflite_url, follow_redirects=True) as response:
+            t0 = time.monotonic()
+            download_deadline = t0 + settings.TFLITE_DOWNLOAD_TIMEOUT_SECONDS
+            downloaded = 0
+            last_progress_log = t0
+            with httpx.stream("GET", tflite_url, follow_redirects=True,
+                              timeout=settings.HF_FETCH_TIMEOUT_SECONDS) as response:
                 response.raise_for_status()
                 for chunk in response.iter_bytes(chunk_size=8192):
+                    if time.monotonic() > download_deadline:
+                        raise TimeoutError(
+                            f"Metadata download timed out after {settings.TFLITE_DOWNLOAD_TIMEOUT_SECONDS}s "
+                            f"({downloaded / 1024 / 1024:.1f} MB received)"
+                        )
                     tmp_file.write(chunk)
+                    downloaded += len(chunk)
+                    now = time.monotonic()
+                    if now - last_progress_log >= 5.0:
+                        logger.debug("Downloading for metadata... %.1f MB received", downloaded / 1024 / 1024)
+                        last_progress_log = now
             tmp_path = tmp_file.name
+        logger.debug("TFLite downloaded (%.1f MB) in %.1fs",
+                     os.path.getsize(tmp_path) / 1024 / 1024, time.monotonic() - t0)
 
-        # Extract metadata
         displayer = metadata.MetadataDisplayer.with_model_file(tmp_path)
         metadata_text = displayer.get_metadata_json()
-        
-        # Cleanup temp file
         os.remove(tmp_path)
-        
-        return metadata_text if metadata_text else "No embedded metadata found in TFLite file."
-    
+
+        result = metadata_text if metadata_text else "No embedded metadata found in TFLite file."
+        logger.debug("Metadata extracted (%d chars)", len(result))
+        return result
+
     except Exception as e:
-        print(f"  -> Warning: Failed to extract TFLite metadata: {e}")
+        logger.warning("Failed to extract TFLite metadata: %s", e)
         return "Metadata extraction failed."
 
-def generate_pipeline_config(task: str, readme_text: str, metadata_text: str, model_card_text: str) -> PipelineGenerationResult | None:
+def generate_pipeline_config(
+    task: str,
+    readme_text: str,
+    metadata_text: str,
+    model_card_text: str,
+    validation_error: str | None = None,
+) -> PipelineGenerationResult | None:
     """
     Feeds the unstructured text to Gemini and forces it to return 
     a strict JSON object matching our PipelineGenerationResult wrapper.
@@ -97,9 +129,17 @@ def generate_pipeline_config(task: str, readme_text: str, metadata_text: str, mo
 
     Model Task: {task}
 
-    CRITICAL INSTRUCTION:
-    If the model cannot be PERFECTLY configured using our exact schema, you MUST set 'is_supported' to false, briefly explain why in 'reasoning', and leave 'config' null.
-    Reject models requiring: audio processing, complex custom C++ ops, or multi-modal inputs.
+    IMPORTANT:
+    Make your best attempt at generating a pipeline config. Do not reject a model just because you are
+    uncertain about exact tensor shapes or dtypes — those will be verified and auto-corrected against
+    the actual TFLite binary after you generate the config. Focus on getting the structure right:
+    correct step types, correct interpretation values, correct routing between tensors.
+
+    Only set 'is_supported' to false for models that are fundamentally incompatible with the schema —
+    i.e. ones whose task cannot be expressed using the available step types at all:
+    - Audio/speech models (no audio preprocessing steps exist in the schema)
+    - Multi-modal models requiring simultaneous image + text inputs
+    - Models that require custom C++ ops with no standard TFLite equivalent
 
     Instructions if supported:
     1. TENSORS: explicitly define 'inputs' and 'outputs' using exact tensor names, shapes, and dtypes.
@@ -234,38 +274,66 @@ def generate_pipeline_config(task: str, readme_text: str, metadata_text: str, mo
     Analyze this model and generate a complete, valid PipelineConfig with ALL required fields:
     - metadata: A list with one MetadataBlock containing model info
     - inputs: A list of TensorDefinition objects for all input tensors
-    - outputs: A list of TensorDefinition objects for all output tensors  
+    - outputs: A list of TensorDefinition objects for all output tensors
     - preprocessing: A LIST of PreprocessBlock objects (each block contains input_name, expects_type, and steps)
     - postprocessing: A LIST of PostprocessBlock objects (each block contains output_name, interpretation, source_tensors, and steps)
-    
+
     --- TFLITE METADATA ---
     {metadata_text}
-    
+
     --- MODEL CARD METADATA ---
     {model_card_text}
-    
+
     --- README ---
     {readme_text}
     """
 
-    try:
-        # Using Gemini's structured outputs with our new wrapper schema
-        response = client.models.generate_content(
+    if validation_error:
+        user_prompt += f"""
+--- PREVIOUS ATTEMPT VALIDATION ERROR ---
+The previously generated pipeline config failed TFLite inference validation with this error:
+
+{validation_error}
+
+Fix the pipeline config to resolve this error. Pay close attention to input shape,
+input dtype (float32 vs uint8), output shape, and preprocessing steps.
+"""
+
+    logger.info("Calling LLM (model=%s, with_error_feedback=%s, timeout=%ds)...",
+                settings.PIPELINE_GENERATION_MODEL, bool(validation_error), settings.LLM_TIMEOUT_SECONDS)
+    t0 = time.monotonic()
+
+    def _call_llm():
+        return client.models.generate_content(
             model=settings.PIPELINE_GENERATION_MODEL,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 response_mime_type="application/json",
                 response_json_schema=PipelineGenerationResult.model_json_schema(),
             ),
-            contents=user_prompt, 
+            contents=user_prompt,
         )
-        
-        # Parse into the wrapper object and return the whole result so we can save the reasoning
+
+    try:
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_call_llm)
+        try:
+            response = future.result(timeout=settings.LLM_TIMEOUT_SECONDS)
+        except FuturesTimeoutError:
+            logger.error("LLM call timed out after %ds", settings.LLM_TIMEOUT_SECONDS)
+            return None
+        finally:
+            executor.shutdown(wait=False)
+
+        elapsed = time.monotonic() - t0
         result = PipelineGenerationResult.model_validate_json(response.text)
+        logger.info("LLM responded in %.1fs — is_supported=%s", elapsed, result.is_supported)
+        if result.reasoning:
+            logger.debug("LLM reasoning: %s", result.reasoning[:300])
         return result
 
     except Exception as e:
-        print(f"  -> LLM Generation Failed: {e}")
+        logger.error("LLM generation failed: %s", e, exc_info=True)
         return None
     
 
@@ -274,44 +342,106 @@ def run_generator_for_version(version: ModelVersionDB, model: MLModelDB, session
     Executes the pipeline generation for a single version and commits to DB.
     Returns True if generation was successfully processed (even if unsupported), False if it failed.
     """
+    label = f"{model.name} / {version.version_name}"
+    logger.info("[%s] ── Starting pipeline generation (task=%s) ──", label, model.task)
+
     # 1. Gather Context
+    logger.debug("[%s] Fetching README (repo=%s, sha=%s)...", label, model.hf_model_id, version.commit_sha)
     readme_text = fetch_hf_readme(model.hf_model_id, version.commit_sha)
+
+    logger.debug("[%s] Fetching model card...", label)
     model_card_text = fetch_hf_model_card(model.hf_model_id)
-    
-    # Extract the TFLite URL from our strictly validated dictionary
-    tflite_url = version.assets.get("tflite") 
+
+    tflite_url = version.assets.get("tflite")
+    if tflite_url:
+        logger.debug("[%s] Fetching TFLite metadata...", label)
+    else:
+        logger.warning("[%s] No TFLite URL in assets — skipping metadata extraction", label)
     metadata_text = fetch_tflite_metadata(tflite_url) if tflite_url else "No TFLite URL found."
 
     # 2. Ask the LLM to generate the configuration
-    print(f"  -> Sending context to LLM (Task: {model.task})...")
+    logger.info("[%s] Sending context to LLM...", label)
     result = generate_pipeline_config(model.task, readme_text, metadata_text, model_card_text)
 
     # 3. Handle the Result
     if result:
         if result.is_supported and result.config:
-            print(f"  -> Success! Generated config with {len(result.config.preprocessing)} preprocessing steps.")
-            
-            # Convert the Pydantic model back to a dictionary for Postgres JSONB storage
+            logger.info("[%s] LLM produced a config (%d pre-steps, %d post-steps)",
+                        label, len(result.config.preprocessing), len(result.config.postprocessing))
+
+            # Validate and auto-correct the pipeline via actual TFLite inference
+            validation_mode = settings.PIPELINE_VALIDATION_MODE
+            if validation_mode == "none" or not tflite_url:
+                if validation_mode == "none":
+                    logger.info("[%s] Validation mode=none — skipping", label)
+                else:
+                    logger.warning("[%s] No TFLite URL — cannot validate, skipping", label)
+                new_status = "unverified"
+                status_reason = None
+            else:
+                # Shared retry loop for both "strict" and "loose"
+                validation_passed = False
+                last_error = None
+                last_retryable = False  # True = structural failure; False = environment failure
+                last_corrected = result.config
+                for attempt in range(settings.MAX_VALIDATION_RETRIES):
+                    logger.info("[%s] Validation attempt %d/%d (mode=%s)...",
+                                label, attempt + 1, settings.MAX_VALIDATION_RETRIES, validation_mode)
+                    ok, error, retryable, corrected = validate_and_correct_pipeline(result.config, tflite_url)
+                    last_corrected = corrected
+                    if ok:
+                        result.config = corrected
+                        validation_passed = True
+                        logger.info("[%s] Validation passed", label)
+                        break
+                    last_error = error
+                    last_retryable = retryable
+                    logger.warning("[%s] Validation attempt %d failed: %s", label, attempt + 1, error)
+                    if not retryable:
+                        logger.warning("[%s] Error is not retryable — skipping further attempts", label)
+                        break
+                    if attempt < settings.MAX_VALIDATION_RETRIES - 1:
+                        logger.info("[%s] Re-asking LLM with validation error context...", label)
+                        retry_result = generate_pipeline_config(
+                            model.task, readme_text, metadata_text, model_card_text,
+                            validation_error=error,
+                        )
+                        if not (retry_result and retry_result.is_supported and retry_result.config):
+                            last_error = "LLM failed to produce a valid config on retry."
+                            logger.error("[%s] LLM retry produced no usable config", label)
+                            break
+                        result = retry_result
+
+                if validation_passed:
+                    new_status = "supported"
+                    status_reason = None
+                else:
+                    # Structural failures (wrong op, bad shape) → broken; environment failures
+                    # (timeout, model too large) → unverified (pipeline may still work on device)
+                    new_status = "broken" if last_retryable else "unverified"
+                    status_reason = f"TFLite validation failed: {last_error}"
+                    result.config = last_corrected
+                    logger.warning("[%s] Validation failed — storing as %s. Reason: %s",
+                                   label, new_status, last_error)
+
+            logger.info("[%s] Saving pipeline config to DB (status=%s)...", label, new_status)
             version.pipeline_spec = result.config.model_dump(mode='json')
-            version.status = "configured"
-            version.is_supported = True
-            version.unsupported_reason = None
+            version.status = new_status
+            version.unsupported_reason = status_reason
         else:
-            print(f"  -> Model gracefully rejected by LLM. Reason: {result.reasoning}")
-            
-            # Store the rejection metadata
+            logger.info("[%s] LLM rejected model — reason: %s", label, result.reasoning)
             version.status = "unsupported"
-            version.is_supported = False
             version.unsupported_reason = result.reasoning
-        
-        # Commit the changes to the database
+
         session.add(version)
         session.commit()
+        logger.info("[%s] ── Done (status=%s) ──", label, version.status)
         return True
     else:
-        print(f"  -> Failed to generate a valid response. Leaving as 'unconfigured'.")
+        logger.error("[%s] LLM returned no result — leaving as unconfigured", label)
         return False
-    
+
+
 
 def run_generator_for_huggingface_model(repo_id: str, commit_sha: str):
     """
@@ -337,59 +467,46 @@ def run_generator_for_huggingface_model(repo_id: str, commit_sha: str):
         run_generator_for_version(version, model, session)
 
 
+def _process_version_isolated(version_id: int, model_id: int) -> bool:
+    """
+    Worker function safe to call from a thread pool.
+    Opens its own DB session so threads don't share state.
+    """
+    with Session(engine) as session:
+        version = session.get(ModelVersionDB, version_id)
+        model = session.get(MLModelDB, model_id)
+        if not version or not model:
+            print(f"  -> Could not load version {version_id} or model {model_id} from DB.")
+            return False
+        print(f"\nProcessing: {model.name} (Version: {version.version_name})")
+        return run_generator_for_version(version, model, session)
+
+
 def process_all_unconfigured():
     """
     The main job loop. Finds all unconfigured versions, gathers context, 
     asks the LLM for a config, and saves it if successful.
     """
     print("Starting LLM Pipeline Generator...")
-    
+
     with Session(engine) as session:
         statement = select(ModelVersionDB, MLModelDB).join(MLModelDB).where(ModelVersionDB.status == "unconfigured")
         results = session.exec(statement).all()
+        pairs = [(v.id, m.id) for v, m in results]
 
-        if not results:
-            print("No unconfigured models found. It's a miracle!")
-            return
+    if not pairs:
+        print("No unconfigured models found. It's a miracle!")
+        return
 
-        for version, model in results:
-            print(f"\nProcessing: {model.name} (Version: {version.version_name})")
-            
-            # 1. Gather Context
-            readme_text = fetch_hf_readme(model.hf_model_id, version.commit_sha)
-            model_card_text = fetch_hf_model_card(model.hf_model_id)
-            
-            # Extract the TFLite URL from our strictly validated dictionary
-            tflite_url = version.assets.get("tflite") 
-            metadata_text = fetch_tflite_metadata(tflite_url) if tflite_url else "No TFLite URL found."
-
-            # 2. Ask the LLM to generate the configuration
-            print(f"  -> Sending context to LLM (Task: {model.task})...")
-            result = generate_pipeline_config(model.task, readme_text, metadata_text, model_card_text)
-
-            # 3. Handle the Result
-            if result:
-                if result.is_supported and result.config:
-                    print(f"  -> Success! Generated config with {len(result.config.preprocessing)} preprocessing steps and {len(result.config.postprocessing)} postprocessing steps.")
-                    
-                    # Convert the Pydantic model back to a dictionary for Postgres JSONB storage
-                    version.pipeline_spec = result.config.model_dump(mode='json')
-                    version.status = "configured"
-                    version.is_supported = True
-                    version.unsupported_reason = None
-                else:
-                    print(f"  -> Model gracefully rejected by LLM. Reason: {result.reasoning}")
-                    
-                    # Store the rejection metadata
-                    version.status = "unsupported"
-                    version.is_supported = False
-                    version.unsupported_reason = result.reasoning
-                
-                # Commit the changes to the database
-                session.add(version)
-                session.commit()
-            else:
-                print(f"  -> Failed to generate a valid response. Leaving as 'unconfigured'.")
+    print(f"Processing {len(pairs)} model(s) with up to {settings.MAX_GENERATOR_WORKERS} parallel workers...")
+    with ThreadPoolExecutor(max_workers=settings.MAX_GENERATOR_WORKERS) as executor:
+        futures = {executor.submit(_process_version_isolated, vid, mid): (vid, mid) for vid, mid in pairs}
+        for future in as_completed(futures):
+            vid, mid = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"  -> Unhandled error for version {vid}: {e}")
 
 
 _SEGMENTATION_TASKS = {"image-segmentation", "semantic-segmentation", "segmentation", "image_segmentation", "semantic_segmentation"}
@@ -411,13 +528,21 @@ def retry_unsupported_segmentation():
         )
         results = session.exec(statement).all()
 
-        if not results:
-            print("No unsupported segmentation models found.")
-            return
+        pairs = [(v.id, m.id) for v, m in results]
 
-        for version, model in results:
-            print(f"\nRetrying: {model.name} (Version: {version.version_name})")
-            run_generator_for_version(version, model, session)
+    if not pairs:
+        print("No unsupported segmentation models found.")
+        return
+
+    print(f"Retrying {len(pairs)} segmentation model(s) with up to {settings.MAX_GENERATOR_WORKERS} parallel workers...")
+    with ThreadPoolExecutor(max_workers=settings.MAX_GENERATOR_WORKERS) as executor:
+        futures = {executor.submit(_process_version_isolated, vid, mid): (vid, mid) for vid, mid in pairs}
+        for future in as_completed(futures):
+            vid, mid = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"  -> Unhandled error for version {vid}: {e}")
 
 
 if __name__ == "__main__":

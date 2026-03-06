@@ -175,7 +175,7 @@ def get_all_models(
         query = query.where(MLModelDB.task == task)
 
     if supported_only:
-        query = query.join(ModelVersionDB).where(ModelVersionDB.is_supported == True).distinct()
+        query = query.join(ModelVersionDB).where(ModelVersionDB.status.in_(["supported", "unverified"])).distinct()
 
     query = query.offset(skip).limit(limit)
     models = session.exec(query).all()
@@ -351,6 +351,29 @@ def download_model_asset(
     # Using a 307 Temporary Redirect ensures the client follows the redirect to fetch the file
     # but doesn't permanently cache the resolution, so you can change storage providers later.
     return RedirectResponse(url=asset_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+@router.delete("/versions/{version_id}/pipeline", response_model=ModelVersionRead, tags=["Model Versions"])
+def delete_pipeline_config(
+    version_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    current_user: UserDB = Depends(get_current_user)
+):
+    """
+    Clears the pipeline configuration for a model version, reverting it to unconfigured.
+    """
+    version = session.get(ModelVersionDB, version_id)
+    if not version:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model version not found.")
+
+    version.pipeline_spec = None
+    version.status = "unconfigured"
+    version.unsupported_reason = None
+
+    session.add(version)
+    session.commit()
+    session.refresh(version)
+    return version
+
 
 # generate a pipeline config for a specific model version
 @router.post("/versions/{version_id}/generate-pipeline", response_model=ModelVersionRead, tags=["Model Versions"])
