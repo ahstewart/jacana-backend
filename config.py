@@ -11,18 +11,8 @@ class Settings(BaseSettings):
     # Load from .env file in the backend directory, with fallback to system env vars
     model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
 
-    # 1. Define the Keys you need (Required)
+    # Supabase (PostgreSQL DB)
     DATABASE_URL: str
-    SUPABASE_DB_URL: str
-    SUPABASE_DB_PASSWORD: str
-
-    # Authentication
-    SUPABASE_JWT_SECRET: str
-
-    # Admin Tool (Optional - for Storage/Auth management)
-    SUPABASE_URL: str
-    SUPABASE_SERVICE_KEY: str
-    SUPABASE_PUBLISHABLE_API_KEY: str
     
     # Backend Settings (with defaults)
     DEBUG: bool = False
