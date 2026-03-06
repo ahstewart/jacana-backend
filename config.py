@@ -9,11 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 class Settings(BaseSettings):
     # Load from .env file in the backend directory, with fallback to system env vars
-    model_config = SettingsConfigDict(
-        env_file=str(BASE_DIR / ".env"),
-        env_file_encoding="utf-8",
-        extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
 
     # 1. Define the Keys you need (Required)
     DATABASE_URL: str
@@ -30,7 +26,7 @@ class Settings(BaseSettings):
     
     # Backend Settings (with defaults)
     DEBUG: bool = False
-    ENVIRONMENT: str = "production"
+    ENVIRONMENT: str = "development"
     PORT: int = 8000
 
     # Hugging Face
@@ -46,22 +42,8 @@ class Settings(BaseSettings):
 # Use lru_cache so we only read the file once per startup
 @lru_cache
 def get_settings():
-    try:
-        return Settings()
-    except Exception as e:
-        # Provide detailed error message
-        env_file = BASE_DIR / ".env"
-        if not env_file.exists():
-            raise FileNotFoundError(
-                f".env file not found at {env_file}. "
-                f"Please create the file or set environment variables."
-            )
-        raise ValueError(
-            f"Failed to load configuration from .env file: {e}\n"
-            f"Looking for .env at: {env_file}\n"
-            f"Make sure all required fields are present in .env file."
-        )
-
+    return Settings()
+    
 # Usage:
 # from config import get_settings
 # settings = get_settings()

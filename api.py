@@ -22,7 +22,7 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select
 from auth import get_current_user
 from hf_sync import run_sync, sync_single_model_version
 from config import get_settings
-from generator import run_generator_for_version, process_all_unconfigured
+from generator import run_generator_for_version, process_all_unconfigured, retry_unsupported_segmentation
 from schema import (
     MLModelDB, 
     MLModelRead, 
@@ -396,14 +396,30 @@ def trigger_pipeline_generation_all(
     current_user: UserDB = Depends(get_current_user)
 ):
     """
-    Kicks off a background job to scan the database for all 'unconfigured' 
+    Kicks off a background job to scan the database for all 'unconfigured'
     model versions and generate their pipelines using the LLM.
     """
     # FastAPI will pass this function to a background worker and return the HTTP response immediately
     background_tasks.add_task(process_all_unconfigured)
-    
+
     return {
         "message": "Batch pipeline generation started in the background. Check server logs for progress.",
+        "status": "processing"
+    }
+
+@router.post("/versions/retry-segmentation", tags=["Model Versions"])
+def retry_segmentation_models(
+    background_tasks: BackgroundTasks,
+    current_user: UserDB = Depends(get_current_user)
+):
+    """
+    Re-runs pipeline generation for all model versions that were previously
+    rejected and belong to a segmentation-task model. Use this after updating
+    the generator rules to support semantic segmentation.
+    """
+    background_tasks.add_task(retry_unsupported_segmentation)
+    return {
+        "message": "Segmentation model retry started in the background. Check server logs for progress.",
         "status": "processing"
     }
 

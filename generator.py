@@ -357,6 +357,34 @@ def process_all_unconfigured():
                 print(f"  -> Failed to generate a valid response. Leaving as 'unconfigured'.")
 
 
+_SEGMENTATION_TASKS = {"image-segmentation", "semantic-segmentation", "segmentation", "image_segmentation", "semantic_segmentation"}
+
+def retry_unsupported_segmentation():
+    """
+    Finds all model versions that were previously rejected and belong to a
+    segmentation-task model, then re-runs pipeline generation for each one.
+    Call this after updating the generator rules to allow segmentation.
+    """
+    print("Retrying previously-rejected segmentation models...")
+
+    with Session(engine) as session:
+        statement = (
+            select(ModelVersionDB, MLModelDB)
+            .join(MLModelDB)
+            .where(ModelVersionDB.status == "unsupported")
+            .where(MLModelDB.task.in_(list(_SEGMENTATION_TASKS)))
+        )
+        results = session.exec(statement).all()
+
+        if not results:
+            print("No unsupported segmentation models found.")
+            return
+
+        for version, model in results:
+            print(f"\nRetrying: {model.name} (Version: {version.version_name})")
+            run_generator_for_version(version, model, session)
+
+
 if __name__ == "__main__":
     #process_all_unconfigured()
     run_generator_for_huggingface_model(repo_id="openai-community/gpt2", commit_sha="607a30d783dfa663caf39e06633721c8d4cfcd7e")
