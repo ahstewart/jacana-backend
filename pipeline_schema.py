@@ -26,11 +26,12 @@ class ResizeImageParams(BaseModel):
     method: Literal["bilinear", "nearest_neighbor"] = Field(default="bilinear")
 
 class NormalizeParams(BaseModel):
-    method: Literal["mean_stddev", "scale_shift"] = Field(default="mean_stddev")
+    method: Literal["mean_stddev", "scale_shift", "scale_div"] = Field(default="mean_stddev")
     mean: Optional[List[float]] = None
     stddev: Optional[List[float]] = None
     scale: Optional[float] = None
     shift: Optional[float] = None
+    value: Optional[float] = None   # used by scale_div (e.g. 255.0)
     color_space: Optional[str] = Field(default="RGB")
 
 class FormatParams(BaseModel):

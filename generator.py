@@ -165,13 +165,26 @@ def generate_pipeline_config(task: str, readme_text: str, metadata_text: str, mo
     RULE: Do NOT set is_supported to false for models whose asset file is .litertlm or .task.
     These models MUST use framework "mediapipe_litert" and the "mediapipe_generate" postprocessing step.
 
-    SEGMENTATION RULE: For models whose output tensor has shape [1, H, W, C] where C > 1 (per-pixel class
-    probabilities), use interpretation "segmentation_mask" and a single "decode_segmentation_mask" step.
-    Set num_classes to C. Use color_map "pascal_voc" for 21-class VOC models, "cityscapes" for 19-class
-    Cityscapes models, and null for everything else. The preprocessing is identical to image classification
-    (resize → normalize → format). Set model_task to "semantic_segmentation".
+    SEGMENTATION RULES:
+    There are two segmentation output formats — choose based on the output tensor shape and dtype:
 
-    EXAMPLE — DeepLab v3 MobileNet (Pascal VOC, 21 classes):
+    FORMAT A — Float32 per-class scores [1, H, W, C] where C > 1:
+      Use interpretation "segmentation_mask" with a "decode_segmentation_mask" step.
+      Set num_classes to C. Preprocessing: resize → normalize (mean_stddev or scale_shift) → format (target_dtype: "float32").
+      Use color_map "pascal_voc" for 21-class VOC, "cityscapes" for 19-class Cityscapes, null otherwise.
+
+    FORMAT B — Uint8/int32 class indices [1, H, W] or [1, H, W, 1] (already argmaxed):
+      Also use interpretation "segmentation_mask" with a "decode_segmentation_mask" step — the inference
+      engine auto-detects whether argmax is needed from the tensor layout.
+      Set num_classes to the number of semantic classes the model was trained on (from the model card).
+      CRITICAL: For uint8 input models, OMIT the normalize step entirely — quantized models have
+      normalization baked into their weights. Use target_dtype: "uint8" in the format step.
+
+    Always set model_task to "semantic_segmentation".
+    Always read input shape, output shape, and dtype from the TFLite metadata — do NOT guess or use
+    values from the model card source code. The TFLite metadata is authoritative.
+
+    EXAMPLE A — DeepLab v3 MobileNet (float32, Pascal VOC, 21 classes):
     {{
       "metadata": [{{"schema_version": "1.0.0", "model_name": "DeepLab v3", "model_version": "1.0",
         "model_task": "semantic_segmentation", "framework": "tflite"}}],
@@ -188,6 +201,28 @@ def generate_pipeline_config(task: str, readme_text: str, metadata_text: str, mo
       "postprocessing": [{{
         "output_name": "segmentation_mask", "interpretation": "segmentation_mask",
         "source_tensors": ["ResizeBilinear_2"],
+        "steps": [
+          {{"step": "decode_segmentation_mask", "params": {{"num_classes": 21, "argmax_axis": -1, "color_map": "pascal_voc"}}}}
+        ]
+      }}]
+    }}
+
+    EXAMPLE B — Quantized segmentation model (uint8 input, class-index output [1, H, W], 21 classes):
+    {{
+      "metadata": [{{"schema_version": "1.0.0", "model_name": "DeepLab v3 Quantized", "model_version": "1.0",
+        "model_task": "semantic_segmentation", "framework": "tflite"}}],
+      "inputs": [{{"name": "input", "shape": [1, 257, 257, 3], "dtype": "uint8"}}],
+      "outputs": [{{"name": "output", "shape": [1, 257, 257], "dtype": "uint8"}}],
+      "preprocessing": [{{
+        "input_name": "input", "expects_type": "image",
+        "steps": [
+          {{"step": "resize_image", "params": {{"height": 257, "width": 257, "method": "bilinear"}}}},
+          {{"step": "format", "params": {{"target_dtype": "uint8", "color_space": "RGB", "data_layout": "NHWC"}}}}
+        ]
+      }}],
+      "postprocessing": [{{
+        "output_name": "segmentation_mask", "interpretation": "segmentation_mask",
+        "source_tensors": ["output"],
         "steps": [
           {{"step": "decode_segmentation_mask", "params": {{"num_classes": 21, "argmax_axis": -1, "color_map": "pascal_voc"}}}}
         ]
