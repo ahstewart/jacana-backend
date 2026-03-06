@@ -21,31 +21,36 @@ def scan_hf_repo_for_version_assets(repo_id: str, commit_sha: str, license_type:
         return None
 
     tflite_files = []
+    litert_lm_files = []
     auxiliary_files = []
     config_file = None
-    
+
     # 1. Parse the File Tree for Assets AND our Standardized Config
     for file in model_info.siblings:
         filename = file.rfilename.lower()
         if filename.endswith(".tflite"):
             tflite_files.append(file)
+        elif filename.endswith(".litertlm") or filename.endswith(".task"):
+            litert_lm_files.append(file)
         elif filename == "pocket_ai.yaml":
             config_file = file
         elif any(ext in filename for ext in [".txt", ".json"]):
             auxiliary_files.append(file)
 
-    if not tflite_files:
+    if not tflite_files and not litert_lm_files:
         return None
 
-    # Apply Heuristics (Pick the best TFLite file, ignore EdgeTPU by default)
-    best_tflite = next((f for f in tflite_files if "edgetpu" not in f.rfilename.lower()), tflite_files[0])
-
     base_resolve_url = f"https://huggingface.co/{repo_id}/resolve/{commit_sha}"
+
+    # Apply Heuristics (Pick the best TFLite file, ignore EdgeTPU by default)
+    best_tflite = next((f for f in tflite_files if "edgetpu" not in f.rfilename.lower()), tflite_files[0]) if tflite_files else None
+    best_litert_lm = litert_lm_files[0] if litert_lm_files else None
 
     # --- THE NEW JSONB ASSET POINTERS MAP ---
     # This matches the schema.py AssetPointers Pydantic model exactly.
     assets = {
-        "tflite": f"{base_resolve_url}/{best_tflite.rfilename}",
+        "tflite": f"{base_resolve_url}/{best_tflite.rfilename}" if best_tflite else None,
+        "litert_lm": f"{base_resolve_url}/{best_litert_lm.rfilename}" if best_litert_lm else None,
         "labels": None,
         "tokenizer": None,
         "vocab": None,
@@ -97,6 +102,6 @@ def scan_hf_repo_for_version_assets(repo_id: str, commit_sha: str, license_type:
         "license_type": clean_license,
         "is_commercial_safe": clean_license in SAFE_LICENSES,
         "requires_commercial_warning": clean_license in RESTRICTED_LICENSES,
-        "file_size_bytes": best_tflite.size or 0,
+        "file_size_bytes": (best_tflite or best_litert_lm).size or 0,
         "status": status 
     }

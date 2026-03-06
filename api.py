@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, UTC
 from fastapi.middleware.cors import CORSMiddleware
 import sqlalchemy
+from sqlalchemy import func
 import os
 import logging
 from huggingface_hub import HfApi, hf_hub_url
@@ -154,10 +155,11 @@ def get_user_models(
 
 @router.get("/models", response_model=List[MLModelRead], tags=["Models"])
 def get_all_models(
-    skip: int = 0, 
-    limit: int = 1000, 
+    skip: int = 0,
+    limit: int = 1000,
     task: str = None,
     supported_only: bool = False,
+    author_id: Optional[uuid.UUID] = None,
     session: Session = Depends(get_session)
 ):
     """
@@ -165,7 +167,10 @@ def get_all_models(
     We use query parameters for filtering, adhering to strict REST guidelines.
     """
     query = select(MLModelDB)
-    
+
+    if author_id:
+        query = query.where(MLModelDB.author_id == author_id)
+
     if task:
         query = query.where(MLModelDB.task == task)
 
@@ -174,7 +179,42 @@ def get_all_models(
 
     query = query.offset(skip).limit(limit)
     models = session.exec(query).all()
-    return models
+
+    # Fetch version counts and max file sizes in single GROUP BY queries instead of N+1 loads
+    version_counts = dict(
+        session.exec(
+            select(ModelVersionDB.model_id, func.count(ModelVersionDB.id))
+            .group_by(ModelVersionDB.model_id)
+        ).all()
+    )
+    file_sizes = dict(
+        session.exec(
+            select(ModelVersionDB.model_id, func.max(ModelVersionDB.file_size_bytes))
+            .group_by(ModelVersionDB.model_id)
+        ).all()
+    )
+
+    return [
+        MLModelRead(
+            id=m.id,
+            author_id=m.author_id,
+            name=m.name,
+            slug=m.slug,
+            description=m.description or "",
+            category=m.category,
+            tags=m.tags or [],
+            task=m.task,
+            hf_model_id=m.hf_model_id,
+            is_verified_official=m.is_verified_official,
+            total_download_count=m.total_download_count,
+            total_ratings=m.total_ratings,
+            rating_weighted_avg=m.rating_weighted_avg,
+            created_at=m.created_at,
+            version_count=version_counts.get(m.id, 0),
+            file_size_bytes=file_sizes.get(m.id, 0) or 0,
+        )
+        for m in models
+    ]
 
 @router.get("/models/{model_id}", response_model=MLModelRead, tags=["Models"])
 def get_model(model_id: uuid.UUID, session: Session = Depends(get_session)):

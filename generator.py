@@ -99,11 +99,10 @@ def generate_pipeline_config(task: str, readme_text: str, metadata_text: str, mo
 
     CRITICAL INSTRUCTION:
     If the model cannot be PERFECTLY configured using our exact schema, you MUST set 'is_supported' to false, briefly explain why in 'reasoning', and leave 'config' null.
-    Reject models requiring: audio processing, complex custom C++ ops, segmentation, or multi-modal inputs.
+    Reject models requiring: audio processing, complex custom C++ ops, or multi-modal inputs.
 
     Instructions if supported:
     1. TENSORS: explicitly define 'inputs' and 'outputs' using exact tensor names, shapes, and dtypes.
-       - CRITICAL: Tensor shapes MUST come ONLY from the TFLite metadata (the input/output tensor definitions in the embedded FlatBuffer). Do NOT use values like n_ctx, max_position_embeddings, or max_length from config.json or the README — these describe the original PyTorch model's capacity, which may be larger than what was baked into the TFLite export. The TFLite metadata is the single source of truth for shape.
        - Use dtype "int32" for token ID tensors (text generation models).
        - Use dtype "float32" for logit/score tensors.
     2. ROUTING: 'input_name' and 'source_tensors' must match the defined tensors.
@@ -151,6 +150,48 @@ def generate_pipeline_config(task: str, readme_text: str, metadata_text: str, mo
       "outputs": [{{"name": "logits", "shape": [1, 512, 50257], "dtype": "float32"}}],
       "preprocessing": [{{"input_name": "input_ids", "expects_type": "text", "steps": [{{"step": "tokenize", "params": {{"max_length": 512, "padding": false, "truncation": true, "add_special_tokens": true}}}}]}}],
       "postprocessing": [{{"output_name": "generated_text", "interpretation": "text_generation", "source_tensors": ["logits"], "steps": [{{"step": "generate", "params": {{"mode": "autoregressive", "max_new_tokens": 128, "temperature": 1.0, "do_sample": false, "eos_token_id": 50256}}}}, {{"step": "decode_tokens", "params": {{"skip_special_tokens": true}}}}]}}]
+    }}
+
+    EXAMPLE — MediaPipe LLM Inference (models with .litertlm or .task asset, e.g. Qwen2.5, Gemma):
+    Use framework "mediapipe_litert". Tensor I/O is abstracted by the API — use a placeholder input/output tensor.
+    {{
+      "metadata": [{{"schema_version": "1.0.0", "model_name": "...", "model_version": "...", "model_task": "text_generation", "framework": "mediapipe_litert", "source_repository": "..."}}],
+      "inputs": [{{"name": "input_text", "shape": [1], "dtype": "int32"}}],
+      "outputs": [{{"name": "output_text", "shape": [1], "dtype": "int32"}}],
+      "preprocessing": [{{"input_name": "input_text", "expects_type": "text", "steps": [{{"step": "tokenize", "params": {{"max_length": 512, "padding": false, "truncation": true, "add_special_tokens": true}}}}]}}],
+      "postprocessing": [{{"output_name": "generated_text", "interpretation": "text_generation", "source_tensors": ["output_text"], "steps": [{{"step": "mediapipe_generate", "params": {{"model_type": "<gemmaIt|qwen|llama|deepSeek|general>", "max_tokens": 512, "temperature": 0.8, "top_k": 40, "top_p": 0.9}}}}]}}]
+    }}
+
+    RULE: Do NOT set is_supported to false for models whose asset file is .litertlm or .task.
+    These models MUST use framework "mediapipe_litert" and the "mediapipe_generate" postprocessing step.
+
+    SEGMENTATION RULE: For models whose output tensor has shape [1, H, W, C] where C > 1 (per-pixel class
+    probabilities), use interpretation "segmentation_mask" and a single "decode_segmentation_mask" step.
+    Set num_classes to C. Use color_map "pascal_voc" for 21-class VOC models, "cityscapes" for 19-class
+    Cityscapes models, and null for everything else. The preprocessing is identical to image classification
+    (resize → normalize → format). Set model_task to "semantic_segmentation".
+
+    EXAMPLE — DeepLab v3 MobileNet (Pascal VOC, 21 classes):
+    {{
+      "metadata": [{{"schema_version": "1.0.0", "model_name": "DeepLab v3", "model_version": "1.0",
+        "model_task": "semantic_segmentation", "framework": "tflite"}}],
+      "inputs": [{{"name": "sub_2", "shape": [1, 257, 257, 3], "dtype": "float32"}}],
+      "outputs": [{{"name": "ResizeBilinear_2", "shape": [1, 257, 257, 21], "dtype": "float32"}}],
+      "preprocessing": [{{
+        "input_name": "sub_2", "expects_type": "image",
+        "steps": [
+          {{"step": "resize_image", "params": {{"height": 257, "width": 257, "method": "bilinear"}}}},
+          {{"step": "normalize", "params": {{"method": "scale_shift", "scale": 0.007843137, "shift": -1.0}}}},
+          {{"step": "format", "params": {{"target_dtype": "float32", "color_space": "RGB", "data_layout": "NHWC"}}}}
+        ]
+      }}],
+      "postprocessing": [{{
+        "output_name": "segmentation_mask", "interpretation": "segmentation_mask",
+        "source_tensors": ["ResizeBilinear_2"],
+        "steps": [
+          {{"step": "decode_segmentation_mask", "params": {{"num_classes": 21, "argmax_axis": -1, "color_map": "pascal_voc"}}}}
+        ]
+      }}]
     }}
     """
 

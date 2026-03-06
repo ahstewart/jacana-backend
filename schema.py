@@ -38,10 +38,11 @@ class DevicePlatform(str, Enum):
 # 1. Define the Strict Asset Contract
 class AssetPointers(PydanticBaseModel):
     """
-    Highly extensible pointer map. 
+    Highly extensible pointer map.
     Adding new asset types here requires ZERO Postgres migrations.
     """
-    tflite: str  # The core execution binary is always required
+    tflite: Optional[str] = None
+    litert_lm: Optional[str] = None
     labels: Optional[str] = None
     tokenizer: Optional[str] = None
     vocab: Optional[str] = None
@@ -125,6 +126,8 @@ class MLModelRead(PydanticBaseModel):
     total_ratings: int
     rating_weighted_avg: float
     created_at: datetime
+    version_count: int = 0
+    file_size_bytes: int = 0
 
 # ==========================================
 # 5. MODEL VERSION ENTITY (The "Logic")

@@ -9,7 +9,7 @@ class MetadataBlock(BaseModel):
     model_name: str
     model_version: str
     model_task: str
-    framework: Literal["tflite", "pytorch_lite", "onnx"] = Field(default="tflite")
+    framework: Literal["tflite", "pytorch_lite", "onnx", "mediapipe_litert"] = Field(default="tflite")
     source_repository: Optional[str] = None
 
 class TensorDefinition(BaseModel):
@@ -64,6 +64,11 @@ class ApplyNMSParams(BaseModel):
     box_tensor: str
     score_tensor: str
 
+class DecodeSegmentationMaskParams(BaseModel):
+    num_classes: int
+    argmax_axis: int = -1          # axis that holds per-class scores (usually last)
+    color_map: Optional[str] = None  # "pascal_voc" | "cityscapes" | "ade20k" | None (auto)
+
 # ==========================================
 # TEXT GENERATION PARAMS
 # ==========================================
@@ -88,6 +93,17 @@ class GenerateParams(BaseModel):
 class DecodeTokensParams(BaseModel):
     skip_special_tokens: bool = Field(default=True, description="Remove special tokens (e.g. [CLS], [SEP], <pad>) from the decoded output string.")
 
+class MediaPipeGenerateParams(BaseModel):
+    model_type: Literal["gemmaIt", "general", "deepSeek", "qwen", "llama", "hammer"] = Field(
+        default="gemmaIt",
+        description="Maps to flutter_gemma ModelType. Use 'qwen' for Qwen models, 'llama' for Llama, 'deepSeek' for DeepSeek, 'gemmaIt' for Gemma instruction-tuned, 'general' for others."
+    )
+    max_tokens: int = 512
+    temperature: float = 0.8
+    top_k: int = 40
+    top_p: float = 0.9
+    random_seed: Optional[int] = None
+
 # ==========================================
 # 4. THE STEP WRAPPERS
 # ==========================================
@@ -96,8 +112,8 @@ class PreprocessStep(BaseModel):
     params: Union[ResizeImageParams, NormalizeParams, FormatParams, TokenizeParams]
 
 class PostprocessStep(BaseModel):
-    step: Literal["apply_activation", "map_labels", "filter_by_score", "decode_boxes", "apply_nms", "generate", "decode_tokens"]
-    params: Union[ApplyActivationParams, MapLabelsParams, FilterByScoreParams, DecodeBoxesParams, ApplyNMSParams, GenerateParams, DecodeTokensParams]
+    step: Literal["apply_activation", "map_labels", "filter_by_score", "decode_boxes", "apply_nms", "generate", "decode_tokens", "mediapipe_generate", "decode_segmentation_mask"]
+    params: Union[ApplyActivationParams, MapLabelsParams, FilterByScoreParams, DecodeBoxesParams, ApplyNMSParams, GenerateParams, DecodeTokensParams, MediaPipeGenerateParams, DecodeSegmentationMaskParams]
 
 # ==========================================
 # 5. THE MASTER CONFIGURATION BLOCKS
