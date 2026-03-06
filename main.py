@@ -1,8 +1,10 @@
+import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from api import router as api_router, start_scheduler, stop_scheduler
 from database import engine
 from sqlmodel import SQLModel
+from config import get_settings
 
 # Define metadata for your Swagger documentation groups
 tags_metadata = [
@@ -65,3 +67,7 @@ app.include_router(api_router, prefix="/api/v1")
 @app.get("/")
 def read_root():
     return {"message": "Pocket AI Lab API is running.", "status": "ok"}
+
+if __name__ == "__main__":
+    settings = get_settings()
+    uvicorn.run("main:app", host="0.0.0.0", port=settings.PORT, reload=settings.DEBUG)

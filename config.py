@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     # Backend Settings (with defaults)
     DEBUG: bool = False
     ENVIRONMENT: str = "production"
+    PORT: int = 8000
 
     # Hugging Face
     HF_SYNC_FETCH_LIMIT: int = 3000000
