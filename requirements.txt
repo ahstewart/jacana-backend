@@ -5,7 +5,6 @@ sqlalchemy
 pydantic
 pydantic-settings
 pydantic-core
-python-jose
 python-multipart
 python-dotenv
 requests
@@ -17,3 +16,4 @@ httpx
 google-genai
 tflite-support
 ai-edge-litert
+supabase
