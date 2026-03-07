@@ -13,6 +13,7 @@ class Settings(BaseSettings):
 
     # Supabase (PostgreSQL DB)
     DATABASE_URL: str
+    SUPABASE_JWT_SECRET: str
     
     # Backend Settings (with defaults)
     DEBUG: bool = False

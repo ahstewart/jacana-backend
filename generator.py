@@ -31,7 +31,7 @@ client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 # THE ENVELOPE PATTERN
 class PipelineGenerationResult(BaseModel):
-    is_supported: bool = Field(description="Set to true ONLY if the model's task and required operations can be perfectly mapped to the provided pipeline schema. Set to false if the model requires unsupported operations (e.g., audio processing, NLP, custom C++ ops) or lacks sufficient metadata.")
+    is_supported: bool = Field(description="Set to true ONLY if the model's task and required operations can be perfectly mapped to the provided pipeline schema. Set to false if the model requires unsupported operations (e.g., custom C++ ops with no standard TFLite equivalent) or lacks sufficient metadata.")
     reasoning: str = Field(description="A brief explanation of why the model is supported or unsupported.")
     config: Optional[PipelineConfig] = Field(default=None, description="The generated pipeline configuration. Must be provided if is_supported is true.")
 
@@ -137,7 +137,6 @@ def generate_pipeline_config(
 
     Only set 'is_supported' to false for models that are fundamentally incompatible with the schema —
     i.e. ones whose task cannot be expressed using the available step types at all:
-    - Audio/speech models (no audio preprocessing steps exist in the schema)
     - Multi-modal models requiring simultaneous image + text inputs
     - Models that require custom C++ ops with no standard TFLite equivalent
 
@@ -200,6 +199,30 @@ def generate_pipeline_config(
       "outputs": [{{"name": "output_text", "shape": [1], "dtype": "int32"}}],
       "preprocessing": [{{"input_name": "input_text", "expects_type": "text", "steps": [{{"step": "tokenize", "params": {{"max_length": 512, "padding": false, "truncation": true, "add_special_tokens": true}}}}]}}],
       "postprocessing": [{{"output_name": "generated_text", "interpretation": "text_generation", "source_tensors": ["output_text"], "steps": [{{"step": "mediapipe_generate", "params": {{"model_type": "<gemmaIt|qwen|llama|deepSeek|general>", "max_tokens": 512, "temperature": 0.8, "top_k": 40, "top_p": 0.9}}}}]}}]
+    }}
+
+    AUTOMATIC SPEECH RECOGNITION RULES:
+    - model_task should be "automatic_speech_recognition"
+    - Most TFLite ASR models (wav2vec2, DeepSpeech) take raw 16kHz PCM: shape [1, N] float32
+      where N = target_sample_rate × max_duration_s  (e.g. 16000 × 5 = 80000)
+    - Use expects_type "audio" with a single "resample_audio" preprocessing step
+    - For CTC models: postprocessing step "ctc_decode" with blank_id=0, word_delimiter="|"
+    - Set interpretation to "speech_recognition"
+    - The vocabulary maps token IDs to characters — use vocabulary_url if known
+
+    EXAMPLE — wav2vec2 TFLite (raw waveform → CTC logits):
+    {{
+      "metadata": [{{"schema_version": "1.0.0", "model_name": "...", "model_version": "...",
+        "model_task": "automatic_speech_recognition", "framework": "tflite", "source_repository": "..."}}],
+      "inputs":  [{{"name": "input_values", "shape": [1, 80000], "dtype": "float32"}}],
+      "outputs": [{{"name": "logits",       "shape": [1, 249, 32], "dtype": "float32"}}],
+      "preprocessing": [{{"input_name": "input_values", "expects_type": "audio",
+        "steps": [{{"step": "resample_audio",
+                   "params": {{"target_sample_rate": 16000, "max_duration_s": 5.0, "normalize": true}}}}]}}],
+      "postprocessing": [{{"output_name": "transcription", "interpretation": "speech_recognition",
+        "source_tensors": ["logits"],
+        "steps": [{{"step": "ctc_decode",
+                   "params": {{"blank_id": 0, "word_delimiter": "|"}}}}]}}]
     }}
 
     RULE: Do NOT set is_supported to false for models whose asset file is .litertlm or .task.

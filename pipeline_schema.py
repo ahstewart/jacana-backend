@@ -71,6 +71,19 @@ class DecodeSegmentationMaskParams(BaseModel):
     color_map: Optional[str] = None  # "pascal_voc" | "cityscapes" | "ade20k" | None (auto)
 
 # ==========================================
+# ASR PARAMS
+# ==========================================
+class ResampleAudioParams(BaseModel):
+    target_sample_rate: int = 16000   # Hz — must match the model's baked-in rate
+    max_duration_s: float = 10.0      # trim/zero-pad to this length
+    normalize: bool = True            # peak-normalize PCM to [-1.0, 1.0]
+
+class CtcDecodeParams(BaseModel):
+    blank_id: int = 0                 # CTC blank token ID (wav2vec2: 0)
+    word_delimiter: str = "|"         # token used as word boundary (wav2vec2: "|")
+    vocabulary_url: Optional[str] = None  # URL/path to vocab file if not in assets
+
+# ==========================================
 # TEXT GENERATION PARAMS
 # ==========================================
 class TokenizeParams(BaseModel):
@@ -109,12 +122,12 @@ class MediaPipeGenerateParams(BaseModel):
 # 4. THE STEP WRAPPERS
 # ==========================================
 class PreprocessStep(BaseModel):
-    step: Literal["resize_image", "normalize", "format", "tokenize"]
-    params: Union[ResizeImageParams, NormalizeParams, FormatParams, TokenizeParams]
+    step: Literal["resize_image", "normalize", "format", "tokenize", "resample_audio"]
+    params: Union[ResizeImageParams, NormalizeParams, FormatParams, TokenizeParams, ResampleAudioParams]
 
 class PostprocessStep(BaseModel):
-    step: Literal["apply_activation", "map_labels", "filter_by_score", "decode_boxes", "apply_nms", "generate", "decode_tokens", "mediapipe_generate", "decode_segmentation_mask"]
-    params: Union[ApplyActivationParams, MapLabelsParams, FilterByScoreParams, DecodeBoxesParams, ApplyNMSParams, GenerateParams, DecodeTokensParams, MediaPipeGenerateParams, DecodeSegmentationMaskParams]
+    step: Literal["apply_activation", "map_labels", "filter_by_score", "decode_boxes", "apply_nms", "generate", "decode_tokens", "mediapipe_generate", "decode_segmentation_mask", "ctc_decode"]
+    params: Union[ApplyActivationParams, MapLabelsParams, FilterByScoreParams, DecodeBoxesParams, ApplyNMSParams, GenerateParams, DecodeTokensParams, MediaPipeGenerateParams, DecodeSegmentationMaskParams, CtcDecodeParams]
 
 # ==========================================
 # 5. THE MASTER CONFIGURATION BLOCKS
