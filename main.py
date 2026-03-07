@@ -36,7 +36,7 @@ app = FastAPI(
 origins = [
     "http://localhost:5173",  # Default Vite React dev server port
     "http://127.0.0.1:5173",
-    # Add your production frontend URL here later, e.g., "https://pocketailab.com"
+    "https://gumbo-zeta.vercel.app",
 ]
 
 app.add_middleware(
