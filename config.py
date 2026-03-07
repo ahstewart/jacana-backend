@@ -13,6 +13,7 @@ class Settings(BaseSettings):
 
     # Supabase (PostgreSQL DB)
     DATABASE_URL: str
+    SUPABASE_URL: str
     SUPABASE_ANON_KEY: str
     
     # Backend Settings (with defaults)
