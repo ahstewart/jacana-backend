@@ -297,5 +297,5 @@ def run_sync(limit: int = settings.HF_SYNC_FETCH_LIMIT) -> Dict[str, int]:
 
 
 if __name__ == "__main__":
-    # Run the sync manually for testing
-    run_sync(limit = 50)
+    # Run the sync manually for cron job
+    run_sync(limit = settings.HF_SYNC_FETCH_LIMIT)

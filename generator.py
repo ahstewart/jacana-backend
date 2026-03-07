@@ -505,20 +505,42 @@ def _process_version_isolated(version_id: int, model_id: int) -> bool:
         return run_generator_for_version(version, model, session)
 
 
+SUPPORTED_TASKS = {
+    "image-classification", "image_classification",
+    "object-detection", "object_detection",
+    "image-segmentation", "image_segmentation",
+    "semantic-segmentation", "semantic_segmentation", "segmentation",
+    "text-generation", "text_generation",
+    "automatic-speech-recognition", "automatic_speech_recognition",
+}
+
+_SEGMENTATION_TASKS = SUPPORTED_TASKS & {
+    "image-segmentation", "image_segmentation",
+    "semantic-segmentation", "semantic_segmentation", "segmentation",
+}
+
+
 def process_all_unconfigured():
     """
-    The main job loop. Finds all unconfigured versions, gathers context, 
-    asks the LLM for a config, and saves it if successful.
+    The main job loop. Finds all model versions that:
+      - belong to a supported task type (one the app can run inference for), AND
+      - are not yet in "supported" status (i.e. still need generation or a retry)
+    Then gathers context, asks the LLM for a config, and saves it if successful.
     """
     print("Starting LLM Pipeline Generator...")
 
     with Session(engine) as session:
-        statement = select(ModelVersionDB, MLModelDB).join(MLModelDB).where(ModelVersionDB.status == "unconfigured")
+        statement = (
+            select(ModelVersionDB, MLModelDB)
+            .join(MLModelDB)
+            .where(ModelVersionDB.status != "supported")
+            .where(MLModelDB.task.in_(list(SUPPORTED_TASKS)))
+        )
         results = session.exec(statement).all()
         pairs = [(v.id, m.id) for v, m in results]
 
     if not pairs:
-        print("No unconfigured models found. It's a miracle!")
+        print("No pending models found.")
         return
 
     print(f"Processing {len(pairs)} model(s) with up to {settings.MAX_GENERATOR_WORKERS} parallel workers...")
@@ -531,8 +553,6 @@ def process_all_unconfigured():
             except Exception as e:
                 print(f"  -> Unhandled error for version {vid}: {e}")
 
-
-_SEGMENTATION_TASKS = {"image-segmentation", "semantic-segmentation", "segmentation", "image_segmentation", "semantic_segmentation"}
 
 def retry_unsupported_segmentation():
     """
@@ -569,5 +589,5 @@ def retry_unsupported_segmentation():
 
 
 if __name__ == "__main__":
-    #process_all_unconfigured()
-    run_generator_for_huggingface_model(repo_id="openai-community/gpt2", commit_sha="607a30d783dfa663caf39e06633721c8d4cfcd7e")
+    process_all_unconfigured()
+    #run_generator_for_huggingface_model(repo_id="openai-community/gpt2", commit_sha="607a30d783dfa663caf39e06633721c8d4cfcd7e")
