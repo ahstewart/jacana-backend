@@ -24,11 +24,12 @@ from hf_sync import run_sync, sync_single_model_version
 from config import get_settings
 from generator import run_generator_for_version, process_all_unconfigured, retry_unsupported_segmentation
 from schema import (
-    MLModelDB, 
-    MLModelRead, 
+    MLModelDB,
+    MLModelRead,
     MLModelCreate,
-    ModelVersionDB, 
-    ModelVersionRead, 
+    ModelVersionDB,
+    ModelVersionRead,
+    ModelVersionCreate,
     ModelVersionUpdate,
     UserDB,
     UserRead,
@@ -194,6 +195,14 @@ def get_all_models(
         ).all()
     )
 
+    # Compute the "best" version status per model (supported > configured > unverified > unconfigured > broken > unsupported)
+    _STATUS_PRIORITY = {"supported": 0, "configured": 1, "unverified": 2, "unconfigured": 3, "broken": 4, "unsupported": 5}
+    best_statuses: dict = {}
+    for vid, vstatus in session.exec(select(ModelVersionDB.model_id, ModelVersionDB.status)).all():
+        current = best_statuses.get(vid)
+        if current is None or _STATUS_PRIORITY.get(vstatus, 99) < _STATUS_PRIORITY.get(current, 99):
+            best_statuses[vid] = vstatus
+
     return [
         MLModelRead(
             id=m.id,
@@ -212,6 +221,7 @@ def get_all_models(
             created_at=m.created_at,
             version_count=version_counts.get(m.id, 0),
             file_size_bytes=file_sizes.get(m.id, 0) or 0,
+            best_version_status=best_statuses.get(m.id),
         )
         for m in models
     ]
@@ -263,6 +273,38 @@ def get_model_versions(model_id: uuid.UUID,
     
     return versions
 
+@router.post("/models/{model_id}/versions", response_model=ModelVersionRead, status_code=status.HTTP_201_CREATED, tags=["Model Versions"])
+def create_model_version(
+    model_id: uuid.UUID,
+    version_in: ModelVersionCreate,
+    session: Session = Depends(get_session),
+    current_user: UserDB = Depends(get_current_user),
+):
+    """Manually create a new model version. Provide pipeline_spec to set status to 'configured'."""
+    model = session.get(MLModelDB, model_id)
+    if not model:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+
+    initial_status = "configured" if version_in.pipeline_spec else "unconfigured"
+    new_version = ModelVersionDB(
+        model_id=model_id,
+        version_name=version_in.version_name,
+        commit_sha=version_in.commit_sha,
+        assets=version_in.assets.model_dump(mode='json'),
+        license_type=version_in.license_type,
+        is_commercial_safe=version_in.is_commercial_safe,
+        requires_commercial_warning=version_in.requires_commercial_warning,
+        file_size_bytes=version_in.file_size_bytes,
+        status=initial_status,
+        changelog=version_in.changelog,
+        pipeline_spec=version_in.pipeline_spec.model_dump(mode='json') if version_in.pipeline_spec else None,
+        pipeline_updated_at=datetime.now(UTC) if version_in.pipeline_spec else None,
+    )
+    session.add(new_version)
+    session.commit()
+    session.refresh(new_version)
+    return new_version
+
 @router.get("/versions/{version_id}", response_model=ModelVersionRead, tags=["Model Versions"])
 def get_version(version_id: uuid.UUID, session: Session = Depends(get_session)):
     """Fetch a specific version and its dynamic asset pointers."""
@@ -294,6 +336,7 @@ def update_model_version_config(
     if payload.pipeline_spec is not None:
         # Pydantic safely converts the complex PipelineConfig object to a basic dict for Postgres
         version.pipeline_spec = payload.pipeline_spec.model_dump(mode='json')
+        version.pipeline_updated_at = datetime.now(UTC)
 
     # 3. Safely Update Status (Only if provided)
     if payload.status is not None:
@@ -305,6 +348,19 @@ def update_model_version_config(
     session.refresh(version)
 
     return version
+
+@router.delete("/versions/{version_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Model Versions"])
+def delete_model_version(
+    version_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    current_user: UserDB = Depends(get_current_user),
+):
+    """Permanently delete a model version and all its associated data."""
+    version = session.get(ModelVersionDB, version_id)
+    if not version:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model version not found.")
+    session.delete(version)
+    session.commit()
 
 @router.get("/versions/{version_id}/download/{asset_key}", tags=["Model Versions", "Downloads"])
 def download_model_asset(
@@ -368,6 +424,7 @@ def delete_pipeline_config(
     version.pipeline_spec = None
     version.status = "unconfigured"
     version.unsupported_reason = None
+    version.pipeline_updated_at = None
 
     session.add(version)
     session.commit()

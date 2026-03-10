@@ -128,6 +128,7 @@ class MLModelRead(PydanticBaseModel):
     created_at: datetime
     version_count: int = 0
     file_size_bytes: int = 0
+    best_version_status: Optional[str] = None
 
 # ==========================================
 # 5. MODEL VERSION ENTITY (The "Logic")
@@ -158,6 +159,7 @@ class ModelVersionDB(ModelVersionBase, table=True):
 
     pipeline_spec: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB))
     unsupported_reason: Optional[str] = None
+    pipeline_updated_at: Optional[datetime] = None
 
     published_at: datetime = Field(default_factory=utc_now)
     download_count: int = 0
@@ -186,6 +188,7 @@ class ModelVersionRead(PydanticBaseModel):
     status: str = "unconfigured"
     changelog: Optional[str] = None
     pipeline_spec: Optional[PipelineConfig] = None
+    pipeline_updated_at: Optional[datetime] = None
     published_at: datetime
     download_count: int
     num_ratings: int

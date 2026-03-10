@@ -2,6 +2,7 @@ import os
 import time
 import tempfile
 import logging
+from datetime import datetime, timezone
 import httpx
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pydantic import ValidationError, BaseModel, Field
@@ -449,6 +450,7 @@ def run_generator_for_version(version: ModelVersionDB, model: MLModelDB, session
 
             logger.info("[%s] Saving pipeline config to DB (status=%s)...", label, new_status)
             version.pipeline_spec = result.config.model_dump(mode='json')
+            version.pipeline_updated_at = datetime.now(timezone.utc)
             version.status = new_status
             version.unsupported_reason = status_reason
         else:
