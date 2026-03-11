@@ -2,6 +2,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlmodel import Session
 from supabase import create_client, Client
+from typing import Optional
 
 from database import get_session
 from schema import UserDB
@@ -13,6 +14,7 @@ settings = get_settings()
 supabase: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
 
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
 
 # ==========================================
 # THE BOUNCER
@@ -63,3 +65,20 @@ def get_current_user(
         session.refresh(user)
 
     return user
+
+
+def get_optional_user(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+    session: Session = Depends(get_session),
+) -> Optional[UserDB]:
+    """Like get_current_user but returns None instead of 401 when unauthenticated."""
+    if not creds:
+        return None
+    try:
+        user_response = supabase.auth.get_user(creds.credentials)
+        if not user_response or not user_response.user:
+            return None
+        user = session.get(UserDB, user_response.user.id)
+        return user
+    except Exception:
+        return None

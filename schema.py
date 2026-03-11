@@ -82,9 +82,10 @@ class UserRead(PydanticBaseModel):
 
 class MLModelBase(SQLModel):
     name: str
-    slug: Optional[str] = Field(index=True, unique=True)
+    slug: Optional[str] = Field(default=None, index=True, unique=True)
     description: Optional[str] = None
     category: ModelCategory = Field(default=ModelCategory.UTILITY)
+    is_public: bool = True
 
 class MLModelDB(MLModelBase, table=True):
     __tablename__ = "ml_models"
@@ -110,6 +111,8 @@ class MLModelDB(MLModelBase, table=True):
 class MLModelCreate(MLModelBase):
     description: str
     tags: List[str] = Field(default_factory=list)
+    task: Optional[str] = None
+    hf_model_id: Optional[str] = None
 
 class MLModelRead(PydanticBaseModel):
     id: uuid.UUID
@@ -122,6 +125,7 @@ class MLModelRead(PydanticBaseModel):
     task: Optional[str] = None
     hf_model_id: Optional[str] = None
     is_verified_official: bool = False
+    is_public: bool = True
     total_download_count: int
     total_ratings: int
     rating_weighted_avg: float
@@ -206,19 +210,26 @@ class ModelVersionUpdate(PydanticBaseModel):
 
 class InferenceLogDB(SQLModel, table=True):
     __tablename__ = "inference_logs"
-    id: Optional[int] = Field(default=None, primary_key=True) 
+    id: Optional[int] = Field(default=None, primary_key=True)
     model_version_id: uuid.UUID = Field(foreign_key="model_versions.id")
     timestamp: datetime = Field(default_factory=utc_now, index=True)
-    
+
     device_model: str
     platform: DevicePlatform
     total_inference_ms: int
     success: bool
-    
+    top_confidence: Optional[float] = Field(default=None)
+    num_results: Optional[int] = Field(default=None)
+    task_type: Optional[str] = Field(default=None)
+
     version: ModelVersionDB = Relationship(back_populates="logs")
 
 class InferenceLogCreate(SQLModel):
+    model_version_id: uuid.UUID
     device_model: str
     platform: DevicePlatform
     total_inference_ms: int
     success: bool
+    top_confidence: Optional[float] = None
+    num_results: Optional[int] = None
+    task_type: Optional[str] = None

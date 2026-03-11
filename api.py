@@ -1,3 +1,4 @@
+import re
 from fastapi import FastAPI, HTTPException, Depends, APIRouter, status
 from pydantic import BaseModel
 from enum import Enum
@@ -19,7 +20,7 @@ from fastapi.responses import RedirectResponse
 
 from database import engine, get_session
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from auth import get_current_user
+from auth import get_current_user, get_optional_user
 from hf_sync import run_sync, sync_single_model_version
 from config import get_settings
 from generator import run_generator_for_version, process_all_unconfigured, retry_unsupported_segmentation
@@ -33,7 +34,9 @@ from schema import (
     ModelVersionUpdate,
     UserDB,
     UserRead,
-    UserBase # Assuming UserBase is used for creation if you don't have UserCreate
+    UserBase, # Assuming UserBase is used for creation if you don't have UserCreate
+    InferenceLogDB,
+    InferenceLogCreate,
 )
 
 # get .env configs
@@ -161,13 +164,22 @@ def get_all_models(
     task: str = None,
     supported_only: bool = False,
     author_id: Optional[uuid.UUID] = None,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
+    current_user: Optional[UserDB] = Depends(get_optional_user),
 ):
     """
     Fetch the high-level model summaries.
     We use query parameters for filtering, adhering to strict REST guidelines.
     """
     query = select(MLModelDB)
+
+    # Visibility: public models are visible to all; private models only to their author
+    if current_user:
+        query = query.where(
+            sqlalchemy.or_(MLModelDB.is_public == True, MLModelDB.author_id == current_user.id)
+        )
+    else:
+        query = query.where(MLModelDB.is_public == True)
 
     if author_id:
         query = query.where(MLModelDB.author_id == author_id)
@@ -215,6 +227,7 @@ def get_all_models(
             task=m.task,
             hf_model_id=m.hf_model_id,
             is_verified_official=m.is_verified_official,
+            is_public=m.is_public,
             total_download_count=m.total_download_count,
             total_ratings=m.total_ratings,
             rating_weighted_avg=m.rating_weighted_avg,
@@ -227,24 +240,38 @@ def get_all_models(
     ]
 
 @router.get("/models/{model_id}", response_model=MLModelRead, tags=["Models"])
-def get_model(model_id: uuid.UUID, session: Session = Depends(get_session)):
+def get_model(
+    model_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    current_user: Optional[UserDB] = Depends(get_optional_user),
+):
     """Fetch a specific model summary."""
     model = session.get(MLModelDB, model_id)
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+    if not model.is_public:
+        if not current_user or current_user.id != model.author_id:
+            raise HTTPException(status_code=404, detail="Model not found")
     return model
 
 @router.post("/models", response_model=MLModelRead, status_code=status.HTTP_201_CREATED, tags=["Models"])
 def create_model(
-    model_in: MLModelCreate, 
+    model_in: MLModelCreate,
     session: Session = Depends(get_session),
     current_user: UserDB = Depends(get_current_user)
 ):
     """Create a new top-level model resource."""
-    # Use the authenticated user as the author
-    author_id = current_user.id 
-    
-    new_model = MLModelDB.model_validate(model_in, update={"author_id": author_id})
+    author_id = current_user.id
+
+    # Auto-generate a unique slug from the model name
+    base_slug = re.sub(r'[^a-z0-9]+', '-', model_in.name.lower()).strip('-')
+    slug = base_slug
+    suffix = 1
+    while session.exec(select(MLModelDB).where(MLModelDB.slug == slug)).first():
+        slug = f"{base_slug}-{suffix}"
+        suffix += 1
+
+    new_model = MLModelDB(**model_in.model_dump(exclude={"slug"}), author_id=author_id, slug=slug)
     session.add(new_model)
     session.commit()
     session.refresh(new_model)
@@ -644,3 +671,40 @@ def manual_sync_specific_version(
     except Exception as e:
         logger.error(f"Error during manual sync for {repo_id} at {commit_sha}: {e}")
         raise HTTPException(status_code=500, detail=f"Manual sync failed: {str(e)}")
+
+
+@router.post("/telemetry/batch", status_code=status.HTTP_201_CREATED, tags=["Telemetry"])
+def upload_telemetry_batch(
+    batch: List[InferenceLogCreate],
+    current_user: UserDB = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """
+    Accept a batch of on-device inference stats from an authenticated user.
+    Each entry is persisted to inference_logs for analytics.
+    """
+    if not batch:
+        return {"accepted": 0}
+
+    created = 0
+    for entry in batch:
+        # Verify the version exists before inserting
+        version = session.get(ModelVersionDB, entry.model_version_id)
+        if version is None:
+            continue  # Skip unknown versions silently
+        log = InferenceLogDB(
+            model_version_id=entry.model_version_id,
+            device_model=entry.device_model,
+            platform=entry.platform,
+            total_inference_ms=entry.total_inference_ms,
+            success=entry.success,
+            top_confidence=entry.top_confidence,
+            num_results=entry.num_results,
+            task_type=entry.task_type,
+        )
+        session.add(log)
+        created += 1
+
+    session.commit()
+    logger.info(f"Telemetry batch: {created}/{len(batch)} records saved (user={current_user.id})")
+    return {"accepted": created}
