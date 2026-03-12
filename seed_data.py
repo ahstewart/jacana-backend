@@ -13,8 +13,8 @@ def create_demo_data():
         # 1. Create a Developer (The User)
         # ==========================================
         dev_user = UserDB(
-            username="pocket_architect",
-            email="architect@pocketai.dev",
+            username="jacana_architect",
+            email="architect@jacana.app",
             is_developer=True
         )
         session.add(dev_user)
@@ -57,7 +57,7 @@ def create_demo_data():
             MLModelAsset(
                 asset_key="tflite_file_v1",
                 asset_type=AssetType.TFLITE,
-                source_url="https://huggingface.co/pocketai/melon/v1.tflite",
+                source_url="https://huggingface.co/jacana/melon/v1.tflite",
                 file_size_bytes=102400,
                 file_hash="sha256:abc123456...",
                 is_hosted_by_us=False

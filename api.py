@@ -188,7 +188,7 @@ def get_all_models(
         query = query.where(MLModelDB.task == task)
 
     if supported_only:
-        query = query.join(ModelVersionDB).where(ModelVersionDB.status.in_(["supported", "unverified"])).distinct()
+        query = query.join(ModelVersionDB).where(ModelVersionDB.status.in_(["supported", "pending"])).distinct()
 
     query = query.offset(skip).limit(limit)
     models = session.exec(query).all()
@@ -207,8 +207,8 @@ def get_all_models(
         ).all()
     )
 
-    # Compute the "best" version status per model (supported > configured > unverified > unconfigured > broken > unsupported)
-    _STATUS_PRIORITY = {"supported": 0, "configured": 1, "unverified": 2, "unconfigured": 3, "broken": 4, "unsupported": 5}
+    # Compute the "best" version status per model (supported > pending > unsupported)
+    _STATUS_PRIORITY = {"supported": 0, "pending": 1, "unsupported": 2}
     best_statuses: dict = {}
     for vid, vstatus in session.exec(select(ModelVersionDB.model_id, ModelVersionDB.status)).all():
         current = best_statuses.get(vid)
@@ -307,12 +307,12 @@ def create_model_version(
     session: Session = Depends(get_session),
     current_user: UserDB = Depends(get_current_user),
 ):
-    """Manually create a new model version. Provide pipeline_spec to set status to 'configured'."""
+    """Manually create a new model version. Provide pipeline_spec to set status to 'pending'."""
     model = session.get(MLModelDB, model_id)
     if not model:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
 
-    initial_status = "configured" if version_in.pipeline_spec else "unconfigured"
+    initial_status = "pending" if version_in.pipeline_spec else "unsupported"
     new_version = ModelVersionDB(
         model_id=model_id,
         version_name=version_in.version_name,
@@ -348,7 +348,7 @@ def update_model_version_config(
     current_user: UserDB = Depends(get_current_user)
 ):
     """
-    Pocket AI Strategy 3: Crowdsourced Configuration Ingestion.
+    Jacana Strategy 3: Crowdsourced Configuration Ingestion.
     Accepts a rigorously validated pipeline_spec from the React UI and commits it.
     """
     # 1. Fetch the Target Version
@@ -449,7 +449,7 @@ def delete_pipeline_config(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model version not found.")
 
     version.pipeline_spec = None
-    version.status = "unconfigured"
+    version.status = "unsupported"
     version.unsupported_reason = None
     version.pipeline_updated_at = None
 

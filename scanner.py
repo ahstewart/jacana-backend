@@ -8,8 +8,8 @@ RESTRICTED_LICENSES = {"gpl", "gpl-2.0", "gpl-3.0", "agpl", "cc-by-nc", "cc-by-n
 
 def scan_hf_repo_for_version_assets(repo_id: str, commit_sha: str, license_type: str) -> Optional[Dict[str, Any]]:
     """
-    Pocket AI Strategy 1 & 2 Combined.
-    Scans for a pocket_ai.yaml config and dynamically builds the AssetPointers map.
+    Jacana Strategy 1 & 2 Combined.
+    Scans for a jacana.yaml config and dynamically builds the AssetPointers map.
     If no config is found, falls back to the Heuristic Scanner.
     """
     api = HfApi()
@@ -32,7 +32,7 @@ def scan_hf_repo_for_version_assets(repo_id: str, commit_sha: str, license_type:
             tflite_files.append(file)
         elif filename.endswith(".litertlm") or filename.endswith(".task"):
             litert_lm_files.append(file)
-        elif filename == "pocket_ai.yaml":
+        elif filename == "jacana.yaml":
             config_file = file
         elif any(ext in filename for ext in [".txt", ".json"]):
             auxiliary_files.append(file)
@@ -76,7 +76,7 @@ def scan_hf_repo_for_version_assets(repo_id: str, commit_sha: str, license_type:
 
     # --- STRATEGY 2: THE STANDARDIZED CONFIG INGESTION ---
     pipeline_spec = None
-    status = "unconfigured"
+    status = "unsupported"
 
     if config_file:
         try:
@@ -84,13 +84,13 @@ def scan_hf_repo_for_version_assets(repo_id: str, commit_sha: str, license_type:
             raw_yaml_url = f"{base_resolve_url}/{config_file.rfilename}"
             response = httpx.get(raw_yaml_url, timeout=5.0)
             response.raise_for_status()
-            
+
             pipeline_spec = yaml.safe_load(response.text)
-            status = "configured" # It has our spec, it's ready for edge execution!
-            
+            status = "pending" # It has our spec, but needs verification
+
         except Exception as e:
-            print(f"Found pocket_ai.yaml in {repo_id} but failed to parse: {e}")
-            status = "unconfigured"
+            print(f"Found jacana.yaml in {repo_id} but failed to parse: {e}")
+            status = "unsupported"
 
     # Build the Version Payload
     return {

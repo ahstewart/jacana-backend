@@ -152,7 +152,7 @@ class ModelVersionBase(SQLModel):
     requires_commercial_warning: bool = False
     file_size_bytes: int = 0
     
-    # State tracking ("unsupported", "unverified", "supported", "broken")
+    # State tracking ("unsupported", "pending", "supported")
     status: str = Field(default="unsupported", index=True)
     changelog: Optional[str] = None
 
@@ -189,7 +189,7 @@ class ModelVersionRead(PydanticBaseModel):
     is_commercial_safe: bool = False
     requires_commercial_warning: bool = False
     file_size_bytes: int = 0
-    status: str = "unconfigured"
+    status: str = "unsupported"
     changelog: Optional[str] = None
     pipeline_spec: Optional[PipelineConfig] = None
     pipeline_updated_at: Optional[datetime] = None

@@ -400,7 +400,7 @@ def run_generator_for_version(version: ModelVersionDB, model: MLModelDB, session
                     logger.info("[%s] Validation mode=none — skipping", label)
                 else:
                     logger.warning("[%s] No TFLite URL — cannot validate, skipping", label)
-                new_status = "unverified"
+                new_status = "pending"
                 status_reason = None
             else:
                 # Shared retry loop for both "strict" and "loose"
@@ -440,9 +440,9 @@ def run_generator_for_version(version: ModelVersionDB, model: MLModelDB, session
                     new_status = "supported"
                     status_reason = None
                 else:
-                    # Structural failures (wrong op, bad shape) → broken; environment failures
-                    # (timeout, model too large) → unverified (pipeline may still work on device)
-                    new_status = "broken" if last_retryable else "unverified"
+                    # Structural failures (wrong op, bad shape) → unsupported; environment failures
+                    # (timeout, model too large) → pending (pipeline may still work on device)
+                    new_status = "unsupported" if last_retryable else "pending"
                     status_reason = f"TFLite validation failed: {last_error}"
                     result.config = last_corrected
                     logger.warning("[%s] Validation failed — storing as %s. Reason: %s",
@@ -463,7 +463,7 @@ def run_generator_for_version(version: ModelVersionDB, model: MLModelDB, session
         logger.info("[%s] ── Done (status=%s) ──", label, version.status)
         return True
     else:
-        logger.error("[%s] LLM returned no result — leaving as unconfigured", label)
+        logger.error("[%s] LLM returned no result — leaving as unsupported", label)
         return False
 
 

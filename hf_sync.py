@@ -2,7 +2,7 @@
 HuggingFace LiteRT Model Syncer
 
 This module fetches all public models with "LiteRT" library from HuggingFace
-and creates/updates corresponding model objects in Pocket AI database.
+and creates/updates corresponding model objects in Jacana database.
 
 This script is designed to run daily via APScheduler.
 """
@@ -15,6 +15,7 @@ from sqlmodel import Session, select
 from huggingface_hub import HfApi
 import sqlalchemy
 import time
+import requests
 
 from schema import MLModelDB, ModelVersionDB, UserDB, ModelCategory
 from database import engine
@@ -31,18 +32,18 @@ logger = logging.getLogger(__name__)
 
 def get_or_create_system_user(session: Session) -> uuid.UUID:
     """
-    Ensures we have a 'Pocket AI System' user to act as the author 
+    Ensures we have a 'Jacana System' user to act as the author
     for automatically synced open-source models.
     """
-    system_email = "system@pocketailab.com"
+    system_email = "system@jacana.app"
     user = session.exec(select(UserDB).where(UserDB.email == system_email)).first()
-    
+
     if not user:
         user = UserDB(
-            username="PocketAISystem",
+            username="JacanaSystem",
             email=system_email,
             is_developer=True,
-            hf_username="pocket_ai_system"
+            hf_username="jacana_system"
         )
         session.add(user)
         session.commit()
@@ -58,6 +59,89 @@ def extract_tag_value(tags: list, prefix: str) -> str:
         if tag.startswith(prefix):
             return tag.replace(prefix, "")
     return ""
+
+
+def interpolate_model_task(hf_model) -> str:
+    """
+    Attempts to determine the task of a Hugging Face model.
+    Accepts an object/dict representing the model data from the Hugging Face API.
+    """
+    # If using the huggingface_hub library, access attributes directly. 
+    # If using a raw dict, change these to hf_model.get("...")
+    pipeline_tag = getattr(hf_model, "pipeline_tag", None)
+    model_id = getattr(hf_model, "modelId", "").lower()
+    tags = [t.lower() for t in getattr(hf_model, "tags", [])]
+
+    # ==========================================
+    # TIER 1: The Explicit Tag
+    # ==========================================
+    if pipeline_tag:
+        return pipeline_tag
+
+    # ==========================================
+    # TIER 2: Keyword Matching in Model ID
+    # Many users name their models after the architecture or dataset.
+    # ==========================================
+    if "whisper" in model_id or "wav2vec" in model_id:
+        return "automatic-speech-recognition"
+    
+    if "yolo" in model_id or "ssd" in model_id or "centernet" in model_id:
+        return "object-detection"
+    
+    if "resnet" in model_id or "mobilenet" in model_id or "efficientnet" in model_id:
+        return "image-classification"
+        
+    if "deeplab" in model_id or "segmentation" in model_id:
+        return "image-segmentation"
+        
+    if "distilbert" in model_id or "roberta" in model_id or "sst2" in model_id:
+        return "text-classification"
+
+    # ==========================================
+    # TIER 3: Tag Scanning
+    # Sometimes users forget the pipeline_tag but add generic tags.
+    # ==========================================
+    for tag in tags:
+        if "speech-recognition" in tag or "asr" in tag:
+            return "automatic-speech-recognition"
+        if "vision" in tag and "classification" in tag:
+            return "image-classification"
+        if "object-detection" in tag:
+            return "object-detection"
+        if "nlp" in tag and "classification" in tag:
+            return "text-classification"
+
+    # ==========================================
+    # TIER 4: The Config Check
+    # If it's a transformer model, it has a config.json file that lists its exact architecture.
+    # ==========================================
+    try:
+        # We ping the raw config file directly from HF
+        config_url = f"https://huggingface.co/{hf_model.modelId}/resolve/main/config.json"
+        response = requests.get(config_url, timeout=3)
+        
+        if response.status_code == 200:
+            config = response.json()
+            architectures = config.get("architectures", [])
+            
+            if architectures:
+                arch = architectures[0].lower()
+                if "forconditionalgeneration" in arch and ("whisper" in arch or "speech" in arch):
+                    return "automatic-speech-recognition"
+                if "forsequenceclassification" in arch:
+                    return "text-classification"
+                if "forimageclassification" in arch:
+                    return "image-classification"
+                if "forobjectdetection" in arch:
+                    return "object-detection"
+    except Exception as e:
+        # Fail gracefully so the nightly sync doesn't crash on network errors
+        print(f"Failed to fetch config for {hf_model.modelId}: {e}")
+
+    # ==========================================
+    # TIER 5: Fallback
+    # ==========================================
+    return "unknown"
 
 def sync_huggingface_models(limit: int = 50):
     """
@@ -93,7 +177,10 @@ def sync_huggingface_models(limit: int = 50):
             try:
                 # 1. Parse Metadata
                 # 'pipeline_tag' is HF's official task categorization (e.g., 'image-classification')
-                task = getattr(hf_model, "pipeline_tag", "unknown") 
+                task = getattr(hf_model, "pipeline_tag", "unknown")
+                if task == "unknown" or task is None:
+                    # If pipeline_tag is missing, try to interpolate from other metadata
+                    task = interpolate_model_task(hf_model)
                 license_type = extract_tag_value(getattr(hf_model, "tags", []), "license:")
                 
                 # 2. Create or Update the Parent Model Summary
@@ -192,7 +279,10 @@ def sync_single_model_version(repo_id: str, commit_sha: str):
         try:
             # 1. Parse Metadata
             # 'pipeline_tag' is HF's official task categorization (e.g., 'image-classification')
-            task = getattr(hf_model, "pipeline_tag", "unknown") 
+            task = getattr(hf_model, "pipeline_tag", "unknown")
+            if task == "unknown" or task is None:
+                # If pipeline_tag is missing, try to interpolate from other metadata
+                task = interpolate_model_task(hf_model)
             license_type = extract_tag_value(getattr(hf_model, "tags", []), "license:")
             
             # 2. Create or Update the Parent Model Summary

@@ -24,7 +24,7 @@ tags_metadata = [
 
 # 1. Initialize the FastAPI application
 app = FastAPI(
-    title="Pocket AI Lab API",
+    title="Jacana API",
     description="Backend service for managing LiteRT models and telemetry.",
     version="1.0.0",
     openapi_tags=tags_metadata
@@ -36,7 +36,7 @@ app = FastAPI(
 origins = [
     "http://localhost:5173",  # Default Vite React dev server port
     "http://127.0.0.1:5173",
-    "https://gumbo-zeta.vercel.app",
+    "https://jacana.vercel.app",
 ]
 
 app.add_middleware(
@@ -66,7 +66,7 @@ app.include_router(api_router, prefix="/api/v1")
 # 5. Root Health Check Route
 @app.get("/")
 def read_root():
-    return {"message": "Pocket AI Lab API is running.", "status": "ok"}
+    return {"message": "Jacana API is running.", "status": "ok"}
 
 if __name__ == "__main__":
     settings = get_settings()
