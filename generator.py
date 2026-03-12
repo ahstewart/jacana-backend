@@ -367,6 +367,16 @@ def run_generator_for_version(version: ModelVersionDB, model: MLModelDB, session
     Returns True if generation was successfully processed (even if unsupported), False if it failed.
     """
     label = f"{model.name} / {version.version_name}"
+
+    # 0. Enforce maximum model size
+    max_bytes = settings.MAX_PIPELINE_MODEL_SIZE_MB * 1024 * 1024
+    if version.file_size_bytes and version.file_size_bytes > max_bytes:
+        logger.warning(
+            "[%s] Skipping — file size %.1f MB exceeds MAX_PIPELINE_MODEL_SIZE_MB (%d MB)",
+            label, version.file_size_bytes / 1024 / 1024, settings.MAX_PIPELINE_MODEL_SIZE_MB,
+        )
+        return False
+
     logger.info("[%s] ── Starting pipeline generation (task=%s) ──", label, model.task)
 
     # 1. Gather Context

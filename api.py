@@ -484,7 +484,17 @@ def trigger_pipeline_generation(
             detail="Parent model not found."
         )
 
-    # 2. Call the generator helper
+    # 2. Enforce maximum model size before calling the generator
+    max_bytes = settings.MAX_PIPELINE_MODEL_SIZE_MB * 1024 * 1024
+    if version.file_size_bytes and version.file_size_bytes > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Model file is too large for pipeline generation "
+                   f"({version.file_size_bytes / 1024 / 1024:.1f} MB — "
+                   f"limit is {settings.MAX_PIPELINE_MODEL_SIZE_MB} MB).",
+        )
+
+    # 3. Call the generator helper
     success = run_generator_for_version(version, model, session)
     
     if not success:
