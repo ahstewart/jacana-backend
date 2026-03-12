@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     #   strict — pipeline must pass invoke() to be stored; failures mark version unsupported
     #   loose  — validation runs for shape correction; invoke() failures are stored with validation_status="not_validated"
     #   none   — skip validation entirely; pipeline is stored as-is
-    PIPELINE_VALIDATION_MODE: str = "strict"
+    PIPELINE_VALIDATION_MODE: str = "loose"
     MAX_VALIDATION_RETRIES: int = 2
     MAX_GENERATOR_WORKERS: int = 1
     MAX_VALIDATOR_DOWNLOAD_MB: int = 500
