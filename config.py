@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     #   none   — skip validation entirely; pipeline is stored as-is
     PIPELINE_VALIDATION_MODE: str = "strict"
     MAX_VALIDATION_RETRIES: int = 2
-    MAX_GENERATOR_WORKERS: int = 5
+    MAX_GENERATOR_WORKERS: int = 1
     MAX_VALIDATOR_DOWNLOAD_MB: int = 500
     # Maximum model file size allowed for pipeline generation (in MB).
     # Versions whose file_size_bytes exceeds this limit are skipped — no LLM call is made.

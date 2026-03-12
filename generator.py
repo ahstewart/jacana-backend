@@ -74,8 +74,11 @@ def fetch_hf_model_card(repo_id: str) -> str:
 def fetch_tflite_metadata(tflite_url: str) -> str:
     """
     Attempts to download the TFLite file and extract embedded FlatBuffer metadata.
+    Respects MAX_VALIDATOR_DOWNLOAD_MB to avoid OOM on large models.
     """
     logger.debug("Downloading TFLite for metadata extraction: %s", tflite_url)
+    max_bytes = settings.MAX_VALIDATOR_DOWNLOAD_MB * 1024 * 1024
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".tflite") as tmp_file:
             t0 = time.monotonic()
@@ -85,6 +88,14 @@ def fetch_tflite_metadata(tflite_url: str) -> str:
             with httpx.stream("GET", tflite_url, follow_redirects=True,
                               timeout=settings.HF_FETCH_TIMEOUT_SECONDS) as response:
                 response.raise_for_status()
+                content_length = int(response.headers.get("content-length", 0))
+                if content_length > max_bytes:
+                    logger.warning(
+                        "TFLite file too large for metadata extraction "
+                        "(%d MB > %d MB) — skipping download",
+                        content_length // 1024 // 1024, settings.MAX_VALIDATOR_DOWNLOAD_MB,
+                    )
+                    return "Metadata extraction skipped: file too large."
                 for chunk in response.iter_bytes(chunk_size=8192):
                     if time.monotonic() > download_deadline:
                         raise TimeoutError(
@@ -93,6 +104,11 @@ def fetch_tflite_metadata(tflite_url: str) -> str:
                         )
                     tmp_file.write(chunk)
                     downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        raise ValueError(
+                            f"TFLite file exceeded size limit during metadata download "
+                            f"({downloaded // 1024 // 1024} MB > {settings.MAX_VALIDATOR_DOWNLOAD_MB} MB)"
+                        )
                     now = time.monotonic()
                     if now - last_progress_log >= 5.0:
                         logger.debug("Downloading for metadata... %.1f MB received", downloaded / 1024 / 1024)
@@ -103,7 +119,6 @@ def fetch_tflite_metadata(tflite_url: str) -> str:
 
         displayer = metadata.MetadataDisplayer.with_model_file(tmp_path)
         metadata_text = displayer.get_metadata_json()
-        os.remove(tmp_path)
 
         result = metadata_text if metadata_text else "No embedded metadata found in TFLite file."
         logger.debug("Metadata extracted (%d chars)", len(result))
@@ -112,6 +127,9 @@ def fetch_tflite_metadata(tflite_url: str) -> str:
     except Exception as e:
         logger.warning("Failed to extract TFLite metadata: %s", e)
         return "Metadata extraction failed."
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 def generate_pipeline_config(
     task: str,
@@ -368,7 +386,7 @@ def run_generator_for_version(version: ModelVersionDB, model: MLModelDB, session
     """
     label = f"{model.name} / {version.version_name}"
 
-    # 0. Enforce maximum model size
+    # 0. Enforce maximum model size (only when file_size_bytes is known and > 0)
     max_bytes = settings.MAX_PIPELINE_MODEL_SIZE_MB * 1024 * 1024
     if version.file_size_bytes and version.file_size_bytes > max_bytes:
         logger.warning(
