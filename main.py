@@ -36,7 +36,10 @@ app = FastAPI(
 origins = [
     "http://localhost:5173",  # Default Vite React dev server port
     "http://127.0.0.1:5173",
-    "https://jacana.vercel.app",
+    "https://jacana.app",
+    "https://www.jacana.app",
+    "https://gumbo-zeta.vercel.app",
+
 ]
 
 app.add_middleware(
